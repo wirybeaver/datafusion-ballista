@@ -139,6 +139,24 @@ impl BallistaAdapter {
         self.inputs.insert(stage_id, stage_output);
         let partitioning = exchange.properties().partitioning.clone();
 
+        if let Some(skew) = exchange.skew_join() {
+            let shards = skew
+                .shards
+                .iter()
+                .map(|shard| {
+                    partitions[shard.upstream_idx as usize]
+                        [shard.start_map_idx as usize..shard.end_map_idx as usize]
+                        .to_vec()
+                })
+                .collect();
+            return Ok(Arc::new(ShuffleReaderExec::try_new_skew_join(
+                stage_id,
+                shards,
+                (*skew).clone(),
+                schema,
+            )?));
+        }
+
         Ok(match (exchange.coalesce(), exchange.broadcast) {
             (Some(cp), false) => {
                 // Concatenate M-shape locations into K-shape per CoalescePlan.groups.
