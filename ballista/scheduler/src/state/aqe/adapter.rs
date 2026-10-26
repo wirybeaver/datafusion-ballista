@@ -20,6 +20,7 @@ use crate::state::aqe::execution_plan::{
     AdaptiveDatafusionExec, ExchangeExec, RangeRepartitionRouting,
 };
 use crate::state::aqe::planner::AdaptiveStageInfo;
+use crate::state::aqe::skew_join::sort_mapper_outputs;
 use crate::state::execution_graph::StageOutput;
 use ballista_core::JobId;
 use ballista_core::execution_plans::{
@@ -120,7 +121,7 @@ impl BallistaAdapter {
         fetch: Option<usize>,
     ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
         let schema = exchange.schema().clone();
-        let partitions = exchange.shuffle_partitions().ok_or_else(|| {
+        let mut partitions = exchange.shuffle_partitions().ok_or_else(|| {
             DataFusionError::Execution(
                 "partitions have to be resolved at this point".to_string(),
             )
@@ -140,6 +141,7 @@ impl BallistaAdapter {
         let partitioning = exchange.properties().partitioning.clone();
 
         if let Some(skew) = exchange.skew_join() {
+            sort_mapper_outputs(&mut partitions);
             let shards = skew
                 .shards
                 .iter()

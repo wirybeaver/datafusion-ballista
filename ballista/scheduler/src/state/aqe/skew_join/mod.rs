@@ -19,3 +19,13 @@
 
 mod algorithm;
 pub(crate) use algorithm::*;
+
+use ballista_core::serde::scheduler::PartitionLocation;
+
+/// Shard windows use mapper order, not the order task completions arrived.
+/// Apply the same ordering when planning ranges and materializing readers.
+pub(crate) fn sort_mapper_outputs(partitions: &mut [Vec<PartitionLocation>]) {
+    for locations in partitions {
+        locations.sort_unstable_by_key(|location| location.map_partition_id);
+    }
+}

@@ -59,9 +59,11 @@ fn partitions(sizes: &[&[u64]]) -> Vec<Vec<PartitionLocation>> {
         .iter()
         .enumerate()
         .map(|(partition, sizes)| {
+            // Mapper completion order must not determine shard windows.
             sizes
                 .iter()
                 .enumerate()
+                .rev()
                 .map(|(mapper, bytes)| {
                     let mut location =
                         mock_partitions_with_size(1, *bytes).remove(0).remove(0);

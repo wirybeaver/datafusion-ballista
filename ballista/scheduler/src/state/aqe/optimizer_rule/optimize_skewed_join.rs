@@ -41,7 +41,7 @@ use log::debug;
 
 use crate::state::aqe::execution_plan::{AdaptiveDatafusionExec, ExchangeExec};
 use crate::state::aqe::skew_join::{
-    map_ranges_for_upstream, pair_shards, skew_threshold,
+    map_ranges_for_upstream, pair_shards, skew_threshold, sort_mapper_outputs,
 };
 
 #[derive(Debug, Default)]
@@ -128,7 +128,7 @@ impl PhysicalOptimizerRule for OptimizeSkewedJoinRule {
         }) {
             return Ok(plan);
         }
-        let (Some(left_parts), Some(right_parts)) =
+        let (Some(mut left_parts), Some(mut right_parts)) =
             (left.shuffle_partitions(), right.shuffle_partitions())
         else {
             return Ok(plan);
@@ -137,6 +137,8 @@ impl PhysicalOptimizerRule for OptimizeSkewedJoinRule {
         if right_parts.len() != partition_count {
             return Ok(plan);
         }
+        sort_mapper_outputs(&mut left_parts);
+        sort_mapper_outputs(&mut right_parts);
         let left_ranges = build_ranges(&left_parts, split_left, &bc);
         let right_ranges = build_ranges(&right_parts, split_right, &bc);
         let (left_shards, right_shards) = pair_shards(&left_ranges, &right_ranges);
