@@ -202,6 +202,13 @@ impl ExchangeExec {
         // same column. `RepartitionExec` clears them for the same reason.
         let mut eq_properties = input.properties().eq_properties.clone();
         eq_properties.clear_per_partition_constants();
+        if matches!(partitioning, Some(Partitioning::Hash(_, _))) {
+            // The sort shuffle writer concatenates contributions from several
+            // local input partitions into one task file. Each contribution can
+            // be sorted while their concatenation is not. Readers must not
+            // advertise that file as an ordered stream for a downstream SMJ.
+            eq_properties.clear_orderings();
+        }
         let properties = Arc::new(PlanProperties::new(
             eq_properties,
             plan_partitioning,

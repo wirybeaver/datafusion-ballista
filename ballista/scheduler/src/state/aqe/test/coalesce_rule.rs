@@ -507,3 +507,65 @@ async fn shuffle_reader_uses_coalesced_k_when_rule_fires() -> datafusion::error:
 
     Ok(())
 }
+
+#[tokio::test]
+async fn storage_groups_are_not_coalesced_on_only_the_exchange_side()
+-> datafusion::error::Result<()> {
+    use crate::state::aqe::execution_plan::ExchangeExec;
+    use crate::state::aqe::optimizer_rule::CoalescePartitionsRule;
+    use ballista_core::config::BALLISTA_STORAGE_PARTITION_JOIN;
+    use ballista_core::storage_partitioning::{
+        BucketedParquetManifest, BucketedParquetTable,
+    };
+    use datafusion::arrow::datatypes::{DataType, Field, Schema};
+    use datafusion::catalog::TableProvider;
+    use datafusion::common::JoinType;
+    use datafusion::physical_expr::expressions::Column;
+    use datafusion::physical_optimizer::PhysicalOptimizerRule;
+    use datafusion::physical_plan::joins::{HashJoinExecBuilder, PartitionMode};
+    use datafusion::physical_plan::{ExecutionPlan, ExecutionPlanProperties};
+
+    let ctx = SessionContext::new_with_config(
+        coalesce_context(8, true)
+            .copied_config()
+            .set_bool(BALLISTA_STORAGE_PARTITION_JOIN, true),
+    );
+    let source = BucketedParquetTable::try_new(
+        Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, true)])),
+        BucketedParquetManifest {
+            object_store_url: "file://".into(),
+            key: "id".into(),
+            buckets: 7,
+            files: vec![],
+        },
+    )?
+    .scan(&ctx.state(), None, &[], None)
+    .await?;
+    let exchange = Arc::new(ExchangeExec::new(source.clone(), None, 0));
+    exchange.set_stage_id(0);
+    exchange.resolve_shuffle_partitions(partitions_with_byte_sizes(&[50; 8]));
+    let join: Arc<dyn ExecutionPlan> = Arc::new(
+        HashJoinExecBuilder::new(
+            exchange.clone(),
+            source.clone(),
+            vec![(
+                Arc::new(Column::new("id", 0)),
+                Arc::new(Column::new("id", 0)),
+            )],
+            JoinType::Inner,
+        )
+        .with_partition_mode(PartitionMode::Partitioned)
+        .build()?,
+    );
+    let root = Arc::new(ExchangeExec::new(join, None, 1));
+    CoalescePartitionsRule.optimize(root, ctx.state().config().options())?;
+    assert!(
+        exchange.coalesce().is_none(),
+        "coalescing one input would break storage group alignment"
+    );
+    assert_eq!(
+        exchange.properties().partitioning.partition_count(),
+        source.output_partitioning().partition_count()
+    );
+    Ok(())
+}

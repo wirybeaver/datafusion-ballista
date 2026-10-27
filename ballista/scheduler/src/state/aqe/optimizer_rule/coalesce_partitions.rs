@@ -115,7 +115,7 @@ use ballista_core::execution_plans::CoalescePlan;
 use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
 use datafusion::config::ConfigOptions;
 use datafusion::physical_optimizer::PhysicalOptimizerRule;
-use datafusion::physical_plan::ExecutionPlan;
+use datafusion::physical_plan::{ExecutionPlan, Partitioning};
 use log::debug;
 
 use crate::state::aqe::coalesce::{
@@ -181,7 +181,12 @@ impl PhysicalOptimizerRule for CoalescePartitionsRule {
         // into the upstream stage's compute — those nodes aren't part of
         // *this* stage's group, they belong to whatever stage wrote them.
         let mut leaves: Vec<Arc<dyn ExecutionPlan>> = Vec::new();
+        let mut has_storage_groups = false;
         input.apply(|node| {
+            if matches!(node.properties().partitioning, Partitioning::Grouped(_)) {
+                has_storage_groups = true;
+                return Ok(TreeNodeRecursion::Stop);
+            }
             if node.is::<ExchangeExec>() {
                 leaves.push(node.clone());
                 Ok(TreeNodeRecursion::Jump)
@@ -189,6 +194,15 @@ impl PhysicalOptimizerRule for CoalescePartitionsRule {
                 Ok(TreeNodeRecursion::Continue)
             }
         })?;
+
+        // A coalesce mapping over exchange leaves cannot also reshape inline
+        // source groups. Keep their common domain until both can be regrouped.
+        // The traversal stops at exchange boundaries, so unrelated native
+        // downstream shuffles remain eligible for ordinary coalescing.
+        if has_storage_groups {
+            debug!("[coalesce-rule] storage grouping present; preserve aligned domain");
+            return Ok(plan);
+        }
 
         // Helper: downcast each Arc back to &ExchangeExec.
         fn as_exchange(arc: &Arc<dyn ExecutionPlan>) -> &ExchangeExec {
@@ -213,6 +227,17 @@ impl PhysicalOptimizerRule for CoalescePartitionsRule {
                     .as_ref()
                     .map(|cp| (cp.groups.len(), cp.upstream_partition_count)),
             );
+        }
+
+        // The coalesced reader concatenates old partitions. Concatenating
+        // sorted streams is not a sorted stream, so retaining an exchange's
+        // ordering would let downstream merge/sort operators return wrong order.
+        if leaves
+            .iter()
+            .any(|leaf| leaf.properties().output_ordering().is_some())
+        {
+            debug!("[coalesce-rule] ordered exchange present; preserve input ordering");
+            return Ok(plan);
         }
 
         // Leaf-scan stage with no upstream Exchanges → nothing to coalesce.
