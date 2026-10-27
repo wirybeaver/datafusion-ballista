@@ -1017,6 +1017,7 @@ dependencies = [
  "env_logger",
  "log",
  "rstest",
+ "serde_json",
  "tempfile",
  "tokio",
  "tonic",

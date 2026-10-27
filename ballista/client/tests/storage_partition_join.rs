@@ -376,6 +376,276 @@ async fn storage_join_dynamic_filters_use_the_proven_partition_domain() {
     }
 }
 
+fn hash_shuffle_bytes() -> u64 {
+    fn visit(path: &Path) -> u64 {
+        std::fs::read_dir(path)
+            .unwrap()
+            .map(|entry| {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    visit(&path)
+                } else if path.file_name().unwrap() == "data.arrow" {
+                    path.metadata().unwrap().len()
+                } else {
+                    0
+                }
+            })
+            .sum()
+    }
+    std::env::split_paths(
+        &std::env::var_os("BALLISTA_SPJ_WORK_DIRS")
+            .expect("cluster harness supplies work dirs"),
+    )
+    .map(|path| visit(&path))
+    .sum()
+}
+
+fn tasks_bound() -> usize {
+    let path = std::env::var("BALLISTA_SPJ_SCHEDULER_LOG").unwrap();
+    std::fs::read_to_string(path)
+        .unwrap()
+        .matches("bind_one: job=")
+        .count()
+}
+
+fn last_job_id() -> String {
+    let path = std::env::var("BALLISTA_SPJ_SCHEDULER_LOG").unwrap();
+    std::fs::read_to_string(path)
+        .unwrap()
+        .lines()
+        .rev()
+        .find_map(|line| {
+            line.split_once("bind_one: job=")
+                .and_then(|(_, tail)| tail.split_whitespace().next())
+        })
+        .unwrap()
+        .to_owned()
+}
+
+#[tokio::test]
+#[ignore = "run with the two-executor harness and release-nonlto artifacts"]
+async fn storage_partition_join_benchmark() {
+    let rows = std::env::var("BALLISTA_SPJ_BENCH_ROWS")
+        .ok()
+        .map(|s| s.parse().unwrap())
+        .unwrap_or(500_000);
+    let dir = input_directory();
+    let a = table(dir.path(), "a", 8, 1, rows);
+    let equal = table(dir.path(), "equal", 8, 3, rows);
+    let control_dir = dir.path().join("control");
+    std::fs::create_dir(&control_dir).unwrap();
+    let _ = table(&control_dir, "plain", 4, 2, rows);
+
+    {
+        let (shape, right) = ("equal", equal);
+        let mut contexts = Vec::new();
+        for enabled in [false, true] {
+            let ctx = ballista_context(config(enabled, false)).await;
+            ctx.register_table("a", remote_table(&a)).unwrap();
+            ctx.register_table("b", remote_table(&right)).unwrap();
+            ctx.register_parquet(
+                "plain",
+                control_dir.to_str().unwrap(),
+                datafusion::prelude::ParquetReadOptions::default(),
+            )
+            .await
+            .unwrap();
+            contexts.push(ctx);
+        }
+        let query = "SELECT count(*) AS n, sum(a.v) AS av, sum(b.v) AS bv FROM a JOIN b ON a.id=b.id";
+        let expected = run(&contexts[0], query).await;
+        assert_eq!(run(&contexts[1], query).await, expected);
+        // Alternating visits keep query shape, data, and cluster fixed.
+        for (visit, enabled) in [false, true, true, false].into_iter().enumerate() {
+            prepare_storage_cache();
+            let before_remote = http_read_metrics().await;
+            let before_bytes = hash_shuffle_bytes();
+            let before_tasks = tasks_bound();
+            let start = std::time::Instant::now();
+            assert_eq!(run(&contexts[usize::from(enabled)], query).await, expected);
+            let millis = start.elapsed().as_secs_f64() * 1000.0;
+            let remote = before_remote
+                .zip(http_read_metrics().await)
+                .map(|(a, b)| (b.0 - a.0, b.1 - a.1));
+            println!(
+                "SPJ_BENCH shape={shape} rows={rows} visit={visit} enabled={enabled} millis={millis:.3} hash_shuffle_data_bytes={} tasks={} remote={remote:?} job={}",
+                hash_shuffle_bytes() - before_bytes,
+                tasks_bound() - before_tasks,
+                last_job_id()
+            );
+        }
+        if shape == "equal" {
+            let control = "SELECT count(*) AS n, sum(v) AS v FROM plain";
+            let control_expected = run(&contexts[0], control).await;
+            assert_eq!(run(&contexts[1], control).await, control_expected);
+            for (visit, enabled) in [false, true, true, false].into_iter().enumerate() {
+                prepare_storage_cache();
+                let before_bytes = hash_shuffle_bytes();
+                let before_tasks = tasks_bound();
+                let start = std::time::Instant::now();
+                assert_eq!(
+                    run(&contexts[usize::from(enabled)], control).await,
+                    control_expected
+                );
+                let millis = start.elapsed().as_secs_f64() * 1000.0;
+                println!(
+                    "SPJ_BENCH shape=unbucketed-control rows={rows} visit={visit} enabled={enabled} millis={millis:.3} hash_shuffle_data_bytes={} tasks={} job={}",
+                    hash_shuffle_bytes() - before_bytes,
+                    tasks_bound() - before_tasks,
+                    last_job_id()
+                );
+            }
+        }
+        let analyze = run(&contexts[1], &format!("EXPLAIN ANALYZE {query}")).await;
+        println!("SPJ_BENCH_PLAN shape={shape}\n{analyze}");
+    }
+}
+
+async fn http_read_metrics() -> Option<(u64, u64)> {
+    use ballista_core::object_store::{
+        runtime_env_with_s3_support, session_config_with_s3_support,
+    };
+    use datafusion::execution::object_store::ObjectStoreUrl;
+    use datafusion::object_store::ObjectStoreExt;
+    let url = std::env::var("BALLISTA_SPJ_HTTP_URL").ok()?;
+    let runtime = runtime_env_with_s3_support(&session_config_with_s3_support()).unwrap();
+    let store = runtime
+        .object_store(ObjectStoreUrl::parse(url).unwrap())
+        .unwrap();
+    let bytes = store
+        .get(&"__spj_metrics".into())
+        .await
+        .unwrap()
+        .bytes()
+        .await
+        .unwrap();
+    let counters: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    Some((
+        counters["get_requests"].as_u64().unwrap(),
+        counters["response_bytes"].as_u64().unwrap(),
+    ))
+}
+
+fn prepare_storage_cache() {
+    let Ok(mode) = std::env::var("BALLISTA_SPJ_STORAGE_CACHE") else {
+        return;
+    };
+    let root = std::env::var("BALLISTA_SPJ_DATA_ROOT").unwrap();
+    let observation = std::process::Command::new("uv")
+        .args(["run", "dev/spj_page_cache.py", &root, &mode])
+        .output()
+        .unwrap();
+    assert!(
+        observation.status.success(),
+        "{}",
+        String::from_utf8_lossy(&observation.stderr)
+    );
+    println!(
+        "SPJ_STORAGE_CACHE {}",
+        String::from_utf8_lossy(&observation.stdout).trim()
+    );
+}
+
+fn load_tpch_table(root: &Path, name: &str) -> Arc<BucketedParquetTable> {
+    use datafusion::parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+    let manifest: BucketedParquetManifest =
+        serde_json::from_reader(File::open(root.join(format!("{name}.json"))).unwrap())
+            .unwrap();
+    let schema = ParquetRecordBatchReaderBuilder::try_new(
+        File::open(&manifest.files[0].path).unwrap(),
+    )
+    .unwrap()
+    .schema()
+    .clone();
+    Arc::new(BucketedParquetTable::try_new(schema, manifest).unwrap())
+}
+
+async fn tpch_result(ctx: &SessionContext, query: &str) -> Vec<Vec<String>> {
+    use datafusion::arrow::util::display::array_value_to_string;
+    let batches = ctx.sql(query).await.unwrap().collect().await.unwrap();
+    batches
+        .iter()
+        .flat_map(|batch| {
+            (0..batch.num_rows()).map(move |row| {
+                batch
+                    .columns()
+                    .iter()
+                    .map(|array| array_value_to_string(array.as_ref(), row).unwrap())
+                    .collect()
+            })
+        })
+        .collect()
+}
+
+#[tokio::test]
+#[ignore = "requires prepared SF data and the two-executor process harness"]
+async fn storage_partition_join_tpch_q12() {
+    let root = std::path::PathBuf::from(std::env::var("BALLISTA_SPJ_TPCH_DATA").unwrap());
+    let oracle: Vec<Vec<serde_json::Value>> =
+        serde_json::from_reader(File::open(root.join("oracle-q12.json")).unwrap())
+            .unwrap();
+    let expected: Vec<Vec<String>> = oracle
+        .into_iter()
+        .map(|row| {
+            row.into_iter()
+                .map(|v| {
+                    v.as_str()
+                        .map(str::to_owned)
+                        .unwrap_or_else(|| v.to_string())
+                })
+                .collect()
+        })
+        .collect();
+    let query = include_str!("../../../benchmarks/queries/q12.sql");
+    let lineitem = load_tpch_table(&root, "lineitem-32");
+    {
+        let (shape, orders_name) = ("equal", "orders-32");
+        let orders = load_tpch_table(&root, orders_name);
+        let mut contexts = Vec::new();
+        for enabled in [false, true] {
+            let ctx =
+                ballista_context(config(enabled, false).with_target_partitions(32)).await;
+            ctx.register_table("orders", remote_table(&orders)).unwrap();
+            ctx.register_table("lineitem", remote_table(&lineitem))
+                .unwrap();
+            contexts.push(ctx);
+        }
+        // Cache preparation and residency verification happen outside the timed
+        // region. Without an explicit mode, no cold/warm assertion is made.
+        for (visit, enabled) in [false, true, true, false].into_iter().enumerate() {
+            prepare_storage_cache();
+            let before = http_read_metrics().await;
+            let before_shuffle = hash_shuffle_bytes();
+            let before_tasks = tasks_bound();
+            let start = std::time::Instant::now();
+            assert_eq!(
+                tpch_result(&contexts[usize::from(enabled)], query).await,
+                expected
+            );
+            let elapsed = start.elapsed().as_secs_f64();
+            let remote = before
+                .zip(http_read_metrics().await)
+                .map(|(a, b)| (b.0 - a.0, b.1 - a.1));
+            println!(
+                "SPJ_TPCH query=q12 shape={shape} visit={visit} enabled={enabled} seconds={elapsed:.6} hash_shuffle_data_bytes={} tasks={} remote={remote:?} job={}",
+                hash_shuffle_bytes() - before_shuffle,
+                tasks_bound() - before_tasks,
+                last_job_id()
+            );
+        }
+        let plan = run(&contexts[1], &format!("EXPLAIN ANALYZE {query}")).await;
+        assert!(
+            !plan.contains("partitioning=Hash([l_orderkey"),
+            "unexpected lineitem join shuffle: {plan}"
+        );
+        assert!(
+            !plan.contains("partitioning=Hash([o_orderkey"),
+            "unexpected orders join shuffle: {plan}"
+        );
+        println!("SPJ_TPCH_PLAN shape={shape}\n{plan}");
+    }
+}
+
 #[derive(Debug)]
 struct RotatedGroups {
     inner: Arc<BucketedParquetTable>,
