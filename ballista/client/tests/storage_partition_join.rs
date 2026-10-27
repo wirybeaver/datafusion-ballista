@@ -20,6 +20,7 @@
 use ballista::prelude::{SessionConfigExt, SessionContextExt};
 use ballista_core::config::{
     BALLISTA_HASH_JOIN_MAX_BUILD_PARTITION_BYTES, BALLISTA_STORAGE_PARTITION_JOIN,
+    BALLISTA_STORAGE_PARTITION_JOIN_DIVISOR,
 };
 use ballista_core::storage_partitioning::{
     BucketFile, BucketedParquetManifest, BucketedParquetTable,
@@ -150,6 +151,7 @@ fn config(enabled: bool, sort: bool) -> SessionConfig {
     SessionConfig::new_with_ballista()
         .with_target_partitions(12)
         .set_bool(BALLISTA_STORAGE_PARTITION_JOIN, enabled)
+        .set_bool(BALLISTA_STORAGE_PARTITION_JOIN_DIVISOR, enabled)
         .set_u64(
             BALLISTA_HASH_JOIN_MAX_BUILD_PARTITION_BYTES,
             if sort { 1 } else { 0 },
@@ -189,7 +191,7 @@ async fn run(ctx: &SessionContext, query: &str) -> String {
 async fn storage_partition_join_matches_shuffle() {
     let dir = input_directory();
     let a = table(dir.path(), "a", 8, 1, 40);
-    let b = table(dir.path(), "b", 8, 2, 40);
+    let b = table(dir.path(), "b", 4, 2, 40);
     let c = table(dir.path(), "c", 8, 3, 40);
     let incompatible = table(dir.path(), "incompatible", 6, 2, 40);
     let empty = Arc::new(
@@ -257,14 +259,14 @@ async fn storage_partition_join_matches_shuffle() {
             );
         }
         // Exercise SQL EXPLAIN through provider transport and the scheduler's
-        // real AQE path, including the storage-group selection reason.
+        // real AQE path. A static-planner explanation misses the divisor rule.
         let explained = run(&ctx, "EXPLAIN SELECT a.id FROM a JOIN b ON a.id=b.id").await;
         assert!(
-            explained.contains("selected: compatible storage groups"),
+            explained.contains("selected: aligned 8/4 buckets"),
             "{explained}"
         );
         assert!(
-            explained.contains("effective_groups=9, effective_buckets=8"),
+            explained.contains("effective_groups=5, effective_buckets=4"),
             "{explained}"
         );
         let fallback =
@@ -432,12 +434,17 @@ async fn storage_partition_join_benchmark() {
     let dir = input_directory();
     let a = table(dir.path(), "a", 8, 1, rows);
     let equal = table(dir.path(), "equal", 8, 3, rows);
+    let divisor = table(dir.path(), "divisor", 4, 2, rows);
+    let reduced = table(dir.path(), "reduced", 2, u32::MAX, rows);
     let control_dir = dir.path().join("control");
     std::fs::create_dir(&control_dir).unwrap();
     let _ = table(&control_dir, "plain", 4, 2, rows);
 
-    {
-        let (shape, right) = ("equal", equal);
+    for (shape, right) in [
+        ("equal", equal),
+        ("divisor", divisor),
+        ("reduced-parallelism", reduced),
+    ] {
         let mut contexts = Vec::new();
         for enabled in [false, true] {
             let ctx = ballista_context(config(enabled, false)).await;
@@ -598,9 +605,23 @@ async fn storage_partition_join_tpch_q12() {
         .collect();
     let query = include_str!("../../../benchmarks/queries/q12.sql");
     let lineitem = load_tpch_table(&root, "lineitem-32");
-    {
-        let (shape, orders_name) = ("equal", "orders-32");
-        let orders = load_tpch_table(&root, orders_name);
+    for (shape, orders_name, buckets) in [
+        ("equal", "orders-32", 32),
+        ("divisor", "orders-16", 16),
+        ("reduced-parallelism", "orders-16", 2),
+    ] {
+        use datafusion::catalog::TableProvider;
+        let source = load_tpch_table(&root, orders_name);
+        // The same immutable files also form a valid two-bucket layout under
+        // modulo reduction. With four executor slots this exercises a real
+        // loss of join parallelism without changing the rows or oracle.
+        let mut manifest = source.manifest().clone();
+        manifest.buckets = buckets;
+        for file in &mut manifest.files {
+            file.bucket = file.bucket.map(|bucket| bucket % buckets);
+        }
+        let orders =
+            Arc::new(BucketedParquetTable::try_new(source.schema(), manifest).unwrap());
         let mut contexts = Vec::new();
         for enabled in [false, true] {
             let ctx =

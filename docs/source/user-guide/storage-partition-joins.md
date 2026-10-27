@@ -84,64 +84,135 @@ partition evolution, or cross-table snapshot isolation. It does not infer
 bucketing from filenames. Register the required object store on the scheduler
 and executors as for ordinary Ballista file scans.
 
-## Enable equal-layout storage joins
+## Enable planning and divisor grouping
 
-The session setting `ballista.optimizer.storage_partition_join` defaults to
-`false`. Opt in with `SessionConfig::new_with_ballista().set_bool(
-"ballista.optimizer.storage_partition_join", true)`.
+Both optimization settings default to `false`. Set them in the session
+configuration used to create the Ballista context:
 
-The production AQE planner recognizes ordinary inner equi-joins whose inputs
-have the same fully specified scheme and ordered group identities. Both Hash
-Join and Sort-Merge Join are supported. Existing broadcast decisions remain
-available. Different layouts, unsupported keys, and unsupported join semantics
-retain ordinary planning. AQE preserves aligned source groups during replan;
-projection without a key drops the distribution guarantee.
-
-`EXPLAIN` reports the initial adaptive plan and each storage-group decision,
-including the effective group count. Runtime statistics may change subsequent
-AQE choices. `EXPLAIN ANALYZE` shows executed stages and their ordinary scan,
-join, and exchange metrics. Partition-dependent dynamic filtering does not
-assume native hash routing for externally grouped inputs.
-
-## Distributed validation and measurements
-
-The process harness uses two executors and supports the existing `bias` and
-`round-robin` policies. It exercises actual provider/task transport, both join
-algorithms, asymmetric empty groups, multiple files, duplicate/null keys,
-projection without the partition key, downstream joins, and executor loss.
-
-```bash
-uv run dev/test_storage_partition_join.py --policy bias --http --kill-executor
-uv run dev/test_storage_partition_join.py --policy round-robin --http
-uv run dev/test_storage_partition_join.py --profile release-nonlto \
-  --benchmark --http --storage-cache cold --policy bias
+```rust
+let config = SessionConfig::new_with_ballista()
+    .set_bool("ballista.optimizer.storage_partition_join", true)
+    .set_bool("ballista.optimizer.storage_partition_join_divisor", true);
 ```
 
-The synthetic benchmark alternates feature off/on on identical files and
-includes an unbucketed scan control. It reports elapsed time, task count,
-actual hash-shuffle file bytes, and HTTP payload bytes. `job-stages.json`
-retains task-duration and input-row distributions. Combined executor RSS is
-sampled every 100 ms over the whole run.
+The production AQE planner aligns ordinary inner equi-joins on the supported
+bucketing key before it creates exchanges. It uses the existing Hash Join or
+Sort-Merge Join selection; source-provided per-group row counts allow the
+existing hash-build-size budget to select Sort-Merge Join when appropriate.
+Unknown source-group size also selects Sort-Merge Join when that budget is
+enabled; setting the budget to zero explicitly opts into Hash Join.
 
-On macOS, `--storage-cache cold` invalidates only the input files' OS pages
-and verifies zero residency with `mincore`; `--storage-cache warm` preloads
-them and verifies full residency. Preparation happens outside query timing.
-This controls the storage server's OS page cache, not disk-controller or
-executor caches, and does not emulate cold S3. The reference HTTP store does
-not cache response data. Fewer exchanges do not mean zero network reads.
+Equal layouts match their semantic scheme and ordered group IDs. With divisor
+grouping enabled, compatible 8/4 layouts combine the larger side's buckets
+`{i, i+4}` with the smaller side's bucket `i`. NULL groups stay separate. File
+groups are rebuilt before sorting; no global bucket-index arithmetic is sent
+to an executor. Unsupported grouping rewrites, incompatible layouts, and
+non-divisor counts retain the normal repartitioning path.
 
-`dev/prepare_spj_tpch.py` prepares immutable bucketed Q12 inputs and an
-independent DuckDB oracle from original TPC-H Parquet. Pass the prepared
-folder using `--tpch-data PATH --http --profile release-nonlto` for the
-32/32 Q12 checkpoint. This branch is the equal-count acceptance milestone;
-divisor grouping and bucket affinity remain required later in the stack.
+Divisor grouping reduces parallelism. The deployment can reject a merge below
+`ballista.optimizer.storage_partition_join_min_buckets` non-null buckets
+(default `1`, allowing all compatible counts). For example, a minimum of `8`
+rejects an 8→4 merge and keeps the normal repartitioned join. Policy rejection
+is reported separately from incompatible transforms. This is an explicit
+parallelism constraint, not a general cost model or a promise that every
+divisible layout is faster. Use the workload
+benchmark before enabling it broadly. Parent operators can still need their
+own exchange even when the join inputs do not.
+
+The provider reports whole-scan as well as per-group statistics. A known-small
+build remains eligible for the existing broadcast policy; that decision is
+checked before regrouping the probe, preserving its original parallelism.
+Source grouping is distinct from a join that already requested a shuffle.
+
+`EXPLAIN` uses the initial AQE plan when adaptive planning is enabled. Its
+`distributed_plan` row includes each join's storage-group decision, scheme,
+effective execution-group count (including the null group), and effective
+non-null bucket count. Rejections distinguish unsupported semantics/layouts
+from disabled divisor alignment, the minimum-bucket policy, and an existing
+broadcast choice. For example, an 8/4 alignment reports
+`selected: aligned 8/4 buckets`, `effective_groups=5`, and
+`effective_buckets=4`. Runtime statistics can change subsequent AQE decisions;
+`EXPLAIN ANALYZE` shows the executed stages and their metrics.
+
+AQE coalescing conservatively preserves stages containing storage groups,
+including mixtures of an inline scan and a passthrough exchange. It also
+preserves ordered exchanges because concatenating their sorted partitions
+would lose the advertised ordering. Native unordered downstream shuffles
+remain eligible for ordinary coalescing.
+
+## Inspect and validate
+
+`EXPLAIN` shows `Grouped(scheme, group_ids, count)` on eligible scans. In a
+compatible join, its input exchange is absent; with incompatible layouts the
+usual exchange remains. Grouped properties are distinct from native hash
+routing, including after projection and downstream joins. Partition-dependent
+dynamic filtering is conservatively disabled for multi-group source joins.
+
+Enable the storage-join optimizer's debug log to see divisor alignment and
+fallback decisions. `EXPLAIN ANALYZE`
+provides ordinary scan, join, and shuffle metrics. Storage reads and shuffle
+traffic are separate costs.
+
+The integration fixture uses real Parquet data, duplicate keys, nulls,
+asymmetric empty buckets, several files per group, both join algorithms,
+downstream native joins, and projection without the bucket key. It compares
+rows with an ordinary-shuffle oracle. Planner coverage separately verifies that
+exchanges are actually removed and that disabling divisor support restores
+them. The process harness additionally exercises executor loss.
+
+For measurements, build the binaries and integration test using
+`--profile release-nonlto` and run:
+
+```bash
+uv run dev/test_storage_partition_join.py --profile release-nonlto --benchmark --policy bias
+```
+
+The benchmark alternates SPJ off/on visits on identical input files and reports
+elapsed time, tasks bound, and actual consolidated hash-shuffle data-file
+bytes. It also captures analyzed plans and checks an ordinary scan control.
+These are warm local shared-filesystem measurements: they do not establish
+cold object-store performance or cache-hit improvements. Do not interpret zero
+join-shuffle bytes as zero storage or network I/O.
+
+## Remote reads and TPC-H Q12
+
+The process harness can serve inputs through a local read-only HTTP range store:
+
+```bash
+uv run dev/test_storage_partition_join.py --profile release-nonlto --http
+uv run dev/test_storage_partition_join.py --profile release-nonlto --http --kill-executor
+```
+
+For a larger query, generate `orders` and `lineitem` with the pinned generator,
+then prepare immutable layouts. The preparation preserves every row, projects
+only Q12's columns, writes orders at 16/32 buckets and lineitem at 32 buckets,
+and computes an independent DuckDB oracle over the original files.
 
 ```bash
 uv tool run --from tpchgen-cli==4.0.0 tpchgen-cli parquet \
   --scale-factor 10 --tables orders,lineitem --parts 16 --num-threads 4 \
   --output-dir .local/spj-tpch-sf10/raw --no-progress
 uv run dev/prepare_spj_tpch.py .local/spj-tpch-sf10/raw .local/spj-tpch-sf10/bucketed
+uv run dev/test_storage_partition_join.py --profile release-nonlto \
+  --tpch-data .local/spj-tpch-sf10/bucketed --http
 ```
 
-See the [equal-layout checkpoint](../contributors-guide/benchmarking/storage-partition-join-equal.md)
-for pinned results, raw metrics, and limitations.
+Use `--policy bias` for the placement control and
+`--executor-cache-capacity 0` to disable session-runtime reuse. Per-visit
+records include server response bytes and GET counts; the full server counters
+are saved in `http-metrics.json`. First and repeated visits are recorded
+separately. Fresh executors or disabled runtime reuse do not make the server's
+OS page cache cold, and this test does not emulate cold S3 storage.
+
+On macOS, add `--storage-cache cold` or `--storage-cache warm` to the HTTP
+benchmark command to prepare and verify the server's OS page cache before
+each timed query. The helper affects only the test inputs and rejects a run
+if page residency does not match the requested state. It does not flush
+disk-controller caches or change executor runtime reuse. The Q12 benchmark
+also tests a 32/2 layout that reduces join parallelism below the four available
+executor slots. `job-stages.json` retains the existing scheduler's task-duration
+and input-row distributions for each job; visit records include job IDs for
+correlation. The [equal-layout checkpoint](../contributors-guide/benchmarking/storage-partition-join-equal.md) records the prerequisite baseline.
+
+Divisor grouping is implemented in this branch. Bucket affinity and the
+combined divisor/affinity acceptance remain required in the next stack layer.
