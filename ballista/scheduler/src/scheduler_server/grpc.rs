@@ -187,6 +187,14 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> SchedulerGrpc
                 TaskDistributionPolicy::RoundRobin => {
                     bind_task_round_robin(budgets, running_jobs, |_| false).await
                 }
+                TaskDistributionPolicy::BucketAffinity => {
+                    // A pull request exposes only this executor's free capacity.
+                    // Preserve progress; cross-executor affinity requires push scheduling.
+                    debug!(
+                        "bucket-affinity fallback: pull scheduling exposes only the requesting executor"
+                    );
+                    bind_task_bias(budgets, running_jobs, |_| false).await
+                }
 
                 TaskDistributionPolicy::Custom(ref policy) => policy
                     .bind_tasks(budgets, running_jobs)

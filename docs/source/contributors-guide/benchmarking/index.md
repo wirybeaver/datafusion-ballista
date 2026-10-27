@@ -88,6 +88,9 @@ Spark <spark>
 Spark + Comet <comet>
 Trino <trino>
 Storage partition joins: equal-layout checkpoint <storage-partition-join-equal>
+Storage partition joins <storage-partition-join>
+Storage partition joins: SF10 Q12 over HTTP <storage-partition-join-sf10>
+Storage partition joins: verified cold/warm caches <storage-partition-join-cache>
 ```
 
 ## Recording a new result set

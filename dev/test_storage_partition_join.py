@@ -71,7 +71,7 @@ def build_artifacts(root, profile, logs):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--profile", default="ci")
-    parser.add_argument("--policy", choices=["bias", "round-robin"], default="bias")
+    parser.add_argument("--policy", choices=["bias", "round-robin", "bucket-affinity"], default="bucket-affinity")
     parser.add_argument("--kill-executor", action="store_true")
     parser.add_argument("--benchmark", action="store_true")
     parser.add_argument("--tpch-data", type=Path)
@@ -101,6 +101,7 @@ def main():
     handles = []
     stop = threading.Event()
     killed = threading.Event()
+    lost_executor = []
     watcher = None
     sampler = None
     peak_rss_kib = [0]
@@ -173,10 +174,20 @@ def main():
 
         if args.kill_executor:
             def fail_after_binding():
+                # The fixture's first join has matching non-null keys in
+                # partition 1. Fail its actual worker, not an arbitrary worker
+                # that might only have received an empty/resultless group.
+                if args.policy == "bucket-affinity":
+                    pattern = r'bucket-affinity job=\S+ stage=0 group=1 preferred=Some\("[^"]+"\) executor=(spj-executor-[01])\b'
+                else:
+                    pattern = r'bind_one: job=\S+ stage=0 exec=(spj-executor-[01]) [^\n]*partitions=\[[^\]]*\b1\b'
                 while not stop.wait(0.005):
                     text = (logs / "scheduler.log").read_text()
-                    if re.search(r"bind_one: job=\S+ .*exec=spj-executor-0\b", text):
-                        executors[0].kill()
+                    match = re.search(pattern, text)
+                    if match:
+                        worker = match[1]
+                        lost_executor.append(worker)
+                        executors[int(worker.rsplit("-", 1)[1])].kill()
                         killed.set()
                         return
             watcher = threading.Thread(target=fail_after_binding, daemon=True)
@@ -198,6 +209,10 @@ def main():
                 command.extend(["--ignored", "storage_partition_join_benchmark"])
             elif args.tpch_data:
                 command.extend(["--ignored", "storage_partition_join_tpch_q12"])
+            elif args.kill_executor:
+                # Other tests may submit unrelated jobs concurrently. Restrict
+                # failure injection to the file-backed SPJ lifecycle scenario.
+                command.append("storage_partition_join_matches_shuffle")
             result = subprocess.run(command, cwd=root, env=env, stdout=output, stderr=subprocess.STDOUT, timeout=900 if args.tpch_data else (300 if args.benchmark else 120))
         print((logs / "test.log").read_text(), end="")
         print(f"policy={args.policy}, killed={killed.is_set()}, elapsed={time.monotonic()-start:.3f}s, peak_executor_rss_kib={peak_rss_kib[0]}, logs={logs}")
@@ -213,11 +228,23 @@ def main():
                 with urllib.request.urlopen(f"http://127.0.0.1:{scheduler_port}/api/job/{job_id}/stages?plan_format=metrics", timeout=10) as response:
                     stages[job_id] = json.load(response)
             (logs / "job-stages.json").write_text(json.dumps(stages, indent=2) + "\n")
+        if args.policy == "bucket-affinity" and not args.benchmark and not args.tpch_data and not args.kill_executor:
+            # The first two queries reverse the join inputs over the same
+            # inventories. Job/task IDs must not change group preferences.
+            assignments = {}
+            for job, group, preferred in re.findall(
+                r'bucket-affinity job=(\S+) stage=0 group=(\d+) preferred=Some\("([^"]+)"\)',
+                (logs / "scheduler.log").read_text(),
+            ):
+                assignments.setdefault(job, {})[group] = preferred
+            first = list(assignments.values())[:2]
+            if len(first) != 2 or first[0] != first[1]:
+                raise RuntimeError("Equivalent storage groups did not retain placement preferences")
         if args.kill_executor:
             if not killed.is_set():
                 raise RuntimeError("Failure injection did not fire")
             scheduler_log = (logs / "scheduler.log").read_text()
-            if "on lost Executor spj-executor-0" not in scheduler_log:
+            if f"on lost Executor {lost_executor[0]}" not in scheduler_log:
                 raise RuntimeError("Executor was killed but task recovery was not observed")
     finally:
         if http_store:

@@ -22,7 +22,7 @@ use datafusion::physical_optimizer::aggregate_statistics::AggregateStatistics;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::convert::TryInto;
 use std::fmt::{Debug, Formatter};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 //use datafusion::physical_optimizer::join_selection::JoinSelection;
 use datafusion::physical_optimizer::PhysicalOptimizerRule;
@@ -206,6 +206,9 @@ pub struct RunningStage {
     pub inputs: HashMap<usize, StageOutput>,
     /// `ExecutionPlan` for this stage
     pub plan: Arc<dyn ExecutionPlan>,
+    /// Source-group keys for this immutable running plan. Placement itself is
+    /// recomputed against current membership and capacity on every bind.
+    pub(crate) bucket_affinity: OnceLock<Option<Arc<[Vec<u8>]>>>,
     /// Cursor over partitions still waiting to be scheduled. Bind time
     /// pulls a chunk sized to the executor's free vcores; failed
     /// partitions are pushed back to the front for re-attempt.
@@ -332,6 +335,11 @@ impl PendingPartitions {
             total,
             queue: VecDeque::new(),
         }
+    }
+
+    /// Next logical partition, including any retry pushed to the front.
+    pub fn front(&self) -> Option<usize> {
+        self.queue.front().copied()
     }
 
     /// Take up to `max` partitions for the next task. Returns an empty
@@ -652,6 +660,7 @@ impl RunningStage {
             output_links,
             inputs,
             plan,
+            bucket_affinity: OnceLock::new(),
             pending: PendingPartitions::new(partitions),
             task_infos: Vec::new(),
             task_failure_numbers: vec![0; partitions],
@@ -1248,6 +1257,7 @@ impl SuccessfulStage {
             output_links: self.output_links.clone(),
             inputs: self.inputs.clone(),
             plan: self.plan.clone(),
+            bucket_affinity: OnceLock::new(),
             pending,
             task_infos: self.task_infos.clone(),
             // It is Ok to forget the previous task failure attempts
