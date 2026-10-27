@@ -135,3 +135,13 @@ independent DuckDB oracle from original TPC-H Parquet. Pass the prepared
 folder using `--tpch-data PATH --http --profile release-nonlto` for the
 32/32 Q12 checkpoint. This branch is the equal-count acceptance milestone;
 divisor grouping and bucket affinity remain required later in the stack.
+
+```bash
+uv tool run --from tpchgen-cli==4.0.0 tpchgen-cli parquet \
+  --scale-factor 10 --tables orders,lineitem --parts 16 --num-threads 4 \
+  --output-dir .local/spj-tpch-sf10/raw --no-progress
+uv run dev/prepare_spj_tpch.py .local/spj-tpch-sf10/raw .local/spj-tpch-sf10/bucketed
+```
+
+See the [equal-layout checkpoint](../contributors-guide/benchmarking/storage-partition-join-equal.md)
+for pinned results, raw metrics, and limitations.
