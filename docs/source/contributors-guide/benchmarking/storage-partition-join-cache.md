@@ -22,8 +22,9 @@
 ## Scope and method
 
 Measured on 2026-10-27 at Ballista
-`7d19106fc420f0300c635079a0633afd33f338a9`, with DataFusion
-`5c977d74d7188e8445a3dd6f4a76c4f533fe6b0d`. The host is an Apple M5 with
+`b230f244b5b3d0e5f653269b837fc77e68636247`, with DataFusion
+`5c977d74d7188e8445a3dd6f4a76c4f533fe6b0d`. Ballista is rebased on upstream
+`98d724b3bd9b603211f444d992b0bcca13c75bca`. The host is an Apple M5 with
 10 CPU cores and 24 GiB RAM, running macOS 26.6.2. Each run starts one
 scheduler and two native executors, each with two vcores, a 1 GB memory pool,
 and session-runtime cache capacity 16. Builds use `release-nonlto`. Benchmark
@@ -64,21 +65,21 @@ official TPC result or a production performance guarantee.
 
 | Server cache | Policy | Buckets | Mean off (s) | Mean on (s) |
 | --- | --- | --- | ---: | ---: |
-| cold | bias | 32/32 | 1.157774 | 0.679185 |
-| cold | bias | 32/16 | 1.094194 | 0.776851 |
-| cold | bias | 32/2 | 1.091890 | 1.103885 |
-| cold | bucket-affinity | 32/32 | 1.134267 | 0.686760 |
-| cold | bucket-affinity | 32/16 | 1.097876 | 0.666968 |
-| cold | bucket-affinity | 32/2 | 1.104927 | 1.094705 |
-| warm | bias | 32/32 | 1.027588 | 0.641558 |
-| warm | bias | 32/16 | 0.989681 | 0.733513 |
-| warm | bias | 32/2 | 0.986896 | 1.068322 |
-| warm | bucket-affinity | 32/32 | 1.047995 | 0.657582 |
-| warm | bucket-affinity | 32/16 | 0.973173 | 0.643558 |
-| warm | bucket-affinity | 32/2 | 0.985126 | 1.086350 |
+| cold | bias | 32/32 | 1.114175 | 0.655381 |
+| cold | bias | 32/16 | 1.078150 | 0.749213 |
+| cold | bias | 32/2 | 1.040467 | 1.097253 |
+| cold | bucket-affinity | 32/32 | 1.108453 | 0.650710 |
+| cold | bucket-affinity | 32/16 | 1.060191 | 0.639498 |
+| cold | bucket-affinity | 32/2 | 1.049916 | 1.094930 |
+| warm | bias | 32/32 | 1.021916 | 0.640829 |
+| warm | bias | 32/16 | 0.961286 | 0.747032 |
+| warm | bias | 32/2 | 0.962451 | 1.062363 |
+| warm | bucket-affinity | 32/32 | 0.981376 | 0.655256 |
+| warm | bucket-affinity | 32/16 | 0.957870 | 0.637374 |
+| warm | bucket-affinity | 32/2 | 0.947591 | 1.128494 |
 
 The 32/2 layout removes the join shuffle but loses its elapsed-time advantage:
-the warm runs are about 8–10% slower than the ordinary-shuffle baseline. This
+the warm runs are about 10–19% slower than the ordinary-shuffle baseline. This
 is evidence for retaining the configurable minimum-bucket policy; divisible
 counts alone are not evidence that SPJ is cheaper.
 
@@ -94,9 +95,9 @@ warm affinity SPJ visit has these join-stage measurements:
 
 | Buckets | Tasks, including empty group | Task duration min / median / max (ms) | Input rows median / max |
 | --- | ---: | --- | --- |
-| 32/32 | 33 | 0 / 76 / 86 | 2,343,654 / 2,349,379 |
-| 32/16 | 17 | 0 / 156 / 164 | 4,685,711 / 4,693,198 |
-| 32/2 | 3 | 0 / 1,078 / 1,086 | 37,479,059 / 37,506,988 |
+| 32/32 | 33 | 1 / 73 / 83 | 2,343,654 / 2,349,379 |
+| 32/16 | 17 | 1 / 148 / 160 | 4,685,711 / 4,693,198 |
+| 32/2 | 3 | 0 / 1,114 / 1,114 | 37,479,059 / 37,506,988 |
 
 The minimum includes an empty null group. The two nonempty 32/2 tasks have
 similar row counts, so their long duration reflects merged work and reduced
@@ -104,8 +105,8 @@ parallelism rather than a single hot key. Bias can bundle multiple partitions
 in one task; affinity binds one complete storage group per task. Task counts
 therefore differ between policies even for the same layout.
 
-Sampled peak combined executor RSS was 1,158,304 KiB (cold bias), 1,186,048 KiB
-(warm bias), 1,201,392 KiB (cold affinity), and 1,223,888 KiB (warm affinity).
+Sampled peak combined executor RSS was 1,211,152 KiB (cold bias), 1,237,984 KiB
+(warm bias), 1,181,456 KiB (cold affinity), and 1,213,040 KiB (warm affinity).
 Sampling is every 100 ms, covers the entire run including both settings, and
 can miss short peaks; it does not establish a per-query memory improvement.
 
@@ -121,14 +122,14 @@ seven tasks and zero hash-shuffle bytes with either feature setting:
 
 | Server cache | Policy | Control mean off (ms) | Control mean on (ms) |
 | --- | --- | ---: | ---: |
-| cold | bias | 7.4960 | 7.6235 |
-| cold | bucket-affinity | 7.8375 | 7.7755 |
-| warm | bias | 6.2985 | 6.3800 |
-| warm | bucket-affinity | 6.5495 | 7.2815 |
+| cold | bias | 7.7550 | 7.4530 |
+| cold | bucket-affinity | 7.7740 | 7.5685 |
+| warm | bias | 6.9380 | 6.7720 |
+| warm | bucket-affinity | 6.6610 | 6.8530 |
 
 Two short observations per arm are insufficient to establish a small control
 regression or a universal performance win. Synthetic-run peak combined RSS
-was 409,600 / 401,296 KiB for cold/warm bias and 401,104 / 388,688 KiB for
+was 385,184 / 407,536 KiB for cold/warm bias and 425,456 / 380,208 KiB for
 cold/warm affinity, subject to the same whole-run sampling limits.
 
 ## Reproduction and evidence
@@ -153,14 +154,14 @@ Raw per-visit results, correlated with join-stage task distributions, are in
 residency observations, scheduler task metrics, and process logs are retained
 under these local run directories:
 
-- `.local/spj-cluster-1793117176821182000`: cold bias.
-- `.local/spj-cluster-1793117286646627000`: warm bias.
-- `.local/spj-cluster-1793117305399858000`: cold affinity.
-- `.local/spj-cluster-1793117324277935000`: warm affinity.
-- `.local/spj-cluster-1793117352816414000`: synthetic cold bias.
-- `.local/spj-cluster-1793117358628469000`: synthetic warm bias.
-- `.local/spj-cluster-1793117364126654000`: synthetic cold affinity.
-- `.local/spj-cluster-1793117369304295000`: synthetic warm affinity.
+- `.local/spj-cluster-1793123684310251000`: q12 cold bias.
+- `.local/spj-cluster-1793123983264316000`: q12 cold bucket-affinity.
+- `.local/spj-cluster-1793123928038788000`: q12 warm bias.
+- `.local/spj-cluster-1793124001844032000`: q12 warm bucket-affinity.
+- `.local/spj-cluster-1793124020164054000`: synthetic cold bias.
+- `.local/spj-cluster-1793124031194582000`: synthetic cold bucket-affinity.
+- `.local/spj-cluster-1793124025665252000`: synthetic warm bias.
+- `.local/spj-cluster-1793124036671992000`: synthetic warm bucket-affinity.
 
 This report closes the controlled local cold/warm and reduced-parallelism
 measurement gaps. It does not claim completion of the entire roadmap, a full

@@ -52,6 +52,13 @@ position, so a four-bucket manifest has five execution groups even when some
 are empty. Projecting away the key drops the partition guarantee and still
 allows the query to execute.
 
+The adapter's versioned scheme also defines group identity encoding:
+`bucket_group_id` uses four-byte unsigned big-endian labels for non-null
+buckets and an empty byte vector for the null group. Providers exposing this
+same scheme must use that convention. Other identity encodings require
+distinct scheme identifiers; divisor normalization needs an adapter for the
+encoding in use. Identical opaque layouts can still use equal-layout SPJ.
+
 The manifest supplies the registered object-store URL, key name, bucket count,
 and each file's object path, exact byte length, optional exact row count, and
 bucket label. A minimal construction is:
@@ -126,6 +133,10 @@ The provider reports whole-scan as well as per-group statistics. A known-small
 build remains eligible for the existing broadcast policy; that decision is
 checked before regrouping the probe, preserving its original parallelism.
 Source grouping is distinct from a join that already requested a shuffle.
+It also does not make an unexecuted join's output size measured. AQE measures
+such a build before considering broadcast, or repartitions when build staging
+is disabled. EXPLAIN reports that policy choice; when a child join is still
+unresolved, it reports the deferred storage-group decision.
 
 `EXPLAIN` uses the initial AQE plan when adaptive planning is enabled. Its
 `distributed_plan` row includes each join's storage-group decision, scheme,
@@ -153,7 +164,9 @@ ballista-executor --task-scheduling-policy push-staged ...
 ```
 
 Affinity uses a deterministic rendezvous preference derived from the actual
-source inventory, normalized group identity, and executor ID. The entire
+source inventory, normalized group identity, and executor ID. The immutable
+source/group keys are prepared once per running stage; executor membership
+and free capacity are evaluated again on every scheduling round. The entire
 aligned group is one scheduling unit. A saturated preferred executor causes an
 immediate eligible-capacity fallback; losing an executor changes placement,
 not the group's input files or retry identity. The existing task-attempt and
