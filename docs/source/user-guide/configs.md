@@ -135,6 +135,8 @@ standard DataFusion settings.
 | ballista.planner.coalesce.target_partition_bytes          | UInt64  | 67108864                      | Target post-coalesce partition size in bytes. Mirrors Spark's advisoryPartitionSizeInBytes.                                                                                                                                                                                                                                                                                                                                                                                            |
 | ballista.planner.parallel_window.enabled                  | Boolean | false                         | Enables the AQE parallel-window rule (ParallelWindowRule), which rewrites bounded-RANGE-frame windows into a distributed range-shuffle so BoundedWindowAggExec's single-partition constraint is not a serial bottleneck. Disabled by default — opt in when the workload contains matching window shapes.                                                                                                                                                                               |
 | ballista.planner.propagate_empty.enabled                  | Boolean | true                          | Enables the AQE propagate-empty-relation rule. Injects EmptyExec into the plan where an input is known to be empty, such as one side of a join, allowing downstream work to be skipped.                                                                                                                                                                                                                                                                                                |
+| ballista.planner.runtime_filter.enabled                   | Boolean | false                         | Enables bounded distributed runtime filters for AQE inner and semi hash joins.                                                                                                                                                                                                                                                                                                                                                                                                         |
+| ballista.planner.runtime_filter.wait_timeout_ms           | UInt64  | 500                           | Maximum probe-stage wait for all build-side runtime filters, in milliseconds. Zero disables waiting.                                                                                                                                                                                                                                                                                                                                                                                   |
 | ballista.planner.skew_join.advisory_partition_bytes       | UInt64  | 67108864                      | Advisory target sub-shard byte size used by the bin-packer when splitting a skewed partition.                                                                                                                                                                                                                                                                                                                                                                                          |
 | ballista.planner.skew_join.enabled                        | Boolean | false                         | Enables the AQE optimize-skewed-join rule (Spark's OptimizeSkewedJoin). Disabled by default — opt in for workloads where per-key skew creates straggler tasks on join inputs. Requires datafusion.optimizer.enable_dynamic_filter_pushdown=false.                                                                                                                                                                                                                                      |
 | ballista.planner.skew_join.partition_threshold_bytes      | UInt64  | 268435456                     | Absolute byte threshold below which a partition is never split (Spark's skewedPartitionThresholdInBytes).                                                                                                                                                                                                                                                                                                                                                                              |
@@ -159,6 +161,36 @@ groups or a fixed row limit, ordered shuffle inputs, and intermediate stages
 that do not repartition their output. Partial aggregation above the join remains
 eligible because the final aggregate merges its groups after the shuffle. Coalescing takes priority when it has already grouped the
 join inputs.
+
+## Distributed Runtime Filters
+
+Runtime filters are opt-in and require adaptive planning. For hash joins:
+
+```sql
+SET ballista.planner.adaptive.enabled = true;
+SET datafusion.optimizer.prefer_hash_join = true;
+SET ballista.planner.runtime_filter.enabled = true;
+SET ballista.planner.runtime_filter.wait_timeout_ms = 500;
+```
+
+The scheduler collects build-side filters from successful tasks and unions them
+only after every build partition finishes. Probe stages wait at most the configured
+timeout without occupying executor slots. A timeout, missing report, or invalid
+filter lets the probe proceed without that filter. Set the timeout to zero to use
+only filters that are already available.
+
+Each filter carries an 8 KiB Bloom summary, an IN summary of up to 128 key hashes,
+and optional MinMax bounds. Large MinMax values are omitted to keep reports
+bounded. Key hashing operates on Arrow batches; collisions retain extra candidates
+for the join to check. `EXPLAIN ANALYZE` shows `RuntimeFilterBuildExec`,
+`RuntimeFilterApplyExec`, and `rows_pruned` metrics.
+
+Filters currently cover the first direct-column equality key of inner and semi
+hash joins. Supported keys include integers, decimals, dates, timestamps, strings,
+binary values, and booleans. Floating-point, nested, and dictionary keys are
+skipped. NULL-safe equality is supported. Filters never cross a LIMIT or an
+aggregate, and are not generated for outer, anti, or mark joins. Use AQE with
+DataFusion's local dynamic-filter pushdown disabled.
 
 ## Shuffle Settings
 
