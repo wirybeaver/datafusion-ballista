@@ -207,6 +207,13 @@ pub const BALLISTA_SHUFFLE_COMPRESSION_CODEC: &str = "ballista.shuffle.compressi
 /// Enable joins that use provider-declared storage groups.
 pub const BALLISTA_STORAGE_PARTITION_JOIN: &str =
     "ballista.optimizer.storage_partition_join";
+/// Allow regrouping compatible divisor bucket counts.
+pub const BALLISTA_STORAGE_PARTITION_JOIN_DIVISOR: &str =
+    "ballista.optimizer.storage_partition_join_divisor";
+
+/// Minimum non-null bucket count allowed after divisor grouping.
+pub const BALLISTA_STORAGE_PARTITION_JOIN_MIN_BUCKETS: &str =
+    "ballista.optimizer.storage_partition_join_min_buckets";
 
 /// Configuration key for the scheduler's per-task partition-slice cap.
 pub const BALLISTA_SCHEDULER_MAX_PARTITIONS_PER_TASK: &str =
@@ -224,8 +231,14 @@ use std::sync::LazyLock;
 
 static CONFIG_ENTRIES: LazyLock<HashMap<String, ConfigEntry>> = LazyLock::new(|| {
     let entries = vec![
+        ConfigEntry::new(BALLISTA_STORAGE_PARTITION_JOIN_MIN_BUCKETS.to_string(),
+                         "Reject divisor grouping below this non-null bucket count; 1 allows all compatible counts. Set to the minimum useful parallelism for the deployment.".to_string(),
+                         DataType::UInt32, Some("1".to_string())),
         ConfigEntry::new(BALLISTA_STORAGE_PARTITION_JOIN.to_string(),
                          "Use provider-declared storage groups for compatible joins.".to_string(),
+                         DataType::Boolean, Some(false.to_string())),
+        ConfigEntry::new(BALLISTA_STORAGE_PARTITION_JOIN_DIVISOR.to_string(),
+                         "Allow compatible divisor bucket grouping for storage partition joins.".to_string(),
                          DataType::Boolean, Some(false.to_string())),
         ConfigEntry::new(BALLISTA_JOB_NAME.to_string(),
                          "Sets the job name that will appear in the web user interface for any submitted jobs".to_string(),
@@ -833,6 +846,16 @@ impl BallistaConfig {
     /// Whether provider-declared storage groups may satisfy join distribution.
     pub fn storage_partition_join_enabled(&self) -> bool {
         self.get_bool_setting(BALLISTA_STORAGE_PARTITION_JOIN)
+    }
+
+    /// Whether storage joins can combine divisor-related bucket groups.
+    pub fn storage_partition_join_divisor_enabled(&self) -> bool {
+        self.get_bool_setting(BALLISTA_STORAGE_PARTITION_JOIN_DIVISOR)
+    }
+
+    /// Minimum non-null bucket count accepted after divisor grouping.
+    pub fn storage_partition_join_min_buckets(&self) -> usize {
+        self.get_usize_setting(BALLISTA_STORAGE_PARTITION_JOIN_MIN_BUCKETS)
     }
 
     /// Whether scan files are pruned by statistics during planning and the
