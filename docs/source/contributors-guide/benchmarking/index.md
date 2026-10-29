@@ -87,6 +87,7 @@ Ballista <ballista>
 Spark <spark>
 Spark + Comet <comet>
 Trino <trino>
+Storage partition joins: equal-layout checkpoint <storage-partition-join-equal>
 ```
 
 ## Recording a new result set

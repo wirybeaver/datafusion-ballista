@@ -53,6 +53,7 @@ Table of content
    :caption: Reference
 
    user-guide/configs
+   user-guide/storage-partition-joins
    user-guide/tuning-guide
    user-guide/metrics
    user-guide/faq
