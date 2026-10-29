@@ -81,6 +81,7 @@ impl RuntimeFilterRegistry {
         stage_id: usize,
         plan: Arc<dyn ExecutionPlan>,
         stages: &HashMap<usize, ExecutionStage>,
+        config: &datafusion::config::ConfigOptions,
         now: Instant,
     ) -> Result<Option<Arc<dyn ExecutionPlan>>> {
         if self.released.contains(&stage_id) {
@@ -131,12 +132,11 @@ impl RuntimeFilterRegistry {
                 let Some(apply) = node.downcast_ref::<RuntimeFilterApplyExec>() else {
                     return Ok(Transformed::no(node));
                 };
-                Ok(Transformed::yes(Arc::new(RuntimeFilterApplyExec::try_new(
-                    apply.children()[0].clone(),
-                    apply.filter_id,
-                    apply.key.clone(),
+                Ok(Transformed::yes(specialize_apply(
+                    apply,
                     ready.get(&apply.filter_id).cloned(),
-                )?)))
+                    config,
+                )?))
             })?
             .data;
         self.release(stage_id);
@@ -147,6 +147,45 @@ impl RuntimeFilterRegistry {
         self.waiting.remove(&stage_id);
         self.released.insert(stage_id);
     }
+}
+
+fn specialize_apply(
+    apply: &RuntimeFilterApplyExec,
+    payload: Option<RuntimeFilterPayload>,
+    config: &datafusion::config::ConfigOptions,
+) -> Result<Arc<dyn ExecutionPlan>> {
+    let apply = Arc::new(RuntimeFilterApplyExec::try_new(
+        apply.children()[0].clone(),
+        apply.filter_id,
+        apply.key.clone(),
+        payload,
+    )?);
+    let child = apply.children()[0].clone();
+    // Optimize only this newly introduced predicate over its scan.
+    // Re-running filter pushdown over an entire AQE stage would append
+    // already-pushed static predicates on every replan.
+    use datafusion::datasource::physical_plan::{FileScanConfig, ParquetSource};
+    use datafusion::datasource::source::DataSourceExec;
+    use datafusion::physical_optimizer::PhysicalOptimizerRule;
+    use datafusion::physical_plan::filter::FilterExec;
+    let parquet = child
+        .downcast_ref::<DataSourceExec>()
+        .and_then(|scan| scan.data_source().downcast_ref::<FileScanConfig>())
+        .is_some_and(|scan| {
+            scan.limit.is_none()
+                && scan.file_source.downcast_ref::<ParquetSource>().is_some()
+        });
+    if parquet && let Some(predicate) = apply.pruning_predicate() {
+        let scan: Arc<dyn ExecutionPlan> =
+            Arc::new(FilterExec::try_new(predicate, child)?);
+        let scan = crate::physical_optimizer::filter_pushdown::FilterPushdown::new()
+            .optimize(scan, config)?;
+        return datafusion::physical_plan::replace_children_if_necessary(
+            apply,
+            vec![scan],
+        );
+    }
+    Ok(apply as Arc<dyn ExecutionPlan>)
 }
 
 fn completed_filter(
@@ -260,7 +299,7 @@ mod tests {
         let mut hub = RuntimeFilterRegistry::new(wait);
         hub.register(1, stages[&1].plan());
         assert!(
-            hub.prepare(2, probe.clone(), &stages, now)
+            hub.prepare(2, probe.clone(), &stages, &Default::default(), now)
                 .unwrap()
                 .is_none()
         );
@@ -276,19 +315,19 @@ mod tests {
         stage.reset_task_info(0);
         stage.task_infos[1] = task(1, 1, Some(report(2).await));
         assert!(
-            hub.prepare(2, probe.clone(), &stages, now)
+            hub.prepare(2, probe.clone(), &stages, &Default::default(), now)
                 .unwrap()
                 .is_none()
         );
         // An independently runnable consumer times out while producer coverage
         // is still partial. It must retain all rows, including the lost key.
         assert!(
-            hub.prepare(3, probe.clone(), &stages, now)
+            hub.prepare(3, probe.clone(), &stages, &Default::default(), now)
                 .unwrap()
                 .is_none()
         );
         let bypass = hub
-            .prepare(3, probe.clone(), &stages, now + wait)
+            .prepare(3, probe.clone(), &stages, &Default::default(), now + wait)
             .unwrap()
             .unwrap();
         let batches = collect(bypass, SessionContext::new().task_ctx())
@@ -301,7 +340,7 @@ mod tests {
         stage.pending.next_slice(1);
         stage.task_infos.push(task(2, 0, Some(report(3).await)));
         let plan = hub
-            .prepare(2, probe.clone(), &stages, now)
+            .prepare(2, probe.clone(), &stages, &Default::default(), now)
             .unwrap()
             .unwrap();
         let batches = collect(plan, SessionContext::new().task_ctx())

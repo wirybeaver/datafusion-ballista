@@ -624,8 +624,13 @@ impl AdaptiveExecutionGraph {
                     unreachable!()
                 };
                 let plan = stage.plan.clone();
-                let prepared = match registry.prepare(id, plan.clone(), &self.stages, now)
-                {
+                let prepared = match registry.prepare(
+                    id,
+                    plan.clone(),
+                    &self.stages,
+                    self.session_config.options(),
+                    now,
+                ) {
                     Ok(prepared) => prepared,
                     Err(error) => {
                         log::warn!(
