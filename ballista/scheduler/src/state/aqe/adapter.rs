@@ -170,11 +170,11 @@ impl BallistaAdapter {
                 )?)
             }
             (None, false) => {
-                // Ordered-writer path: when the child declared an output
+                // Ordered-writer path: when the exchange guarantees an output
                 // ordering, preserve it across the shuffle boundary with a
                 // k-way merge instead of the arrival-order concat that the
                 // regular reader does.
-                if let Some(ordering) = exchange.input().output_ordering() {
+                if let Some(ordering) = exchange.properties().output_ordering() {
                     Arc::new(
                         RangeShuffleReaderExec::try_new(
                             stage_id,

@@ -16,8 +16,8 @@
 // under the License.
 
 use ballista_core::config::BallistaConfig;
-use datafusion::physical_plan::StatisticsArgs;
 use datafusion::physical_plan::statistics::StatisticsContext;
+use datafusion::physical_plan::{Partitioning, StatisticsArgs};
 use datafusion::{
     arrow::compute::SortOptions,
     arrow::datatypes::{DataType, Schema},
@@ -52,6 +52,8 @@ pub enum JoinInputState {
     /// All inputs has been repartitioned
     /// which means this join can be resolved
     Repartitioned,
+    /// Compatible source groups, without a previously paid shuffle cost.
+    SourcePartitioned,
     /// State on join inputs is unknown
     Unknown,
 }
@@ -294,6 +296,14 @@ impl DynamicJoinSelectionExec {
 
         let build_max_partition_bytes = max_per_partition_build_bytes(build_side);
 
+        // Storage joins skip the shuffle that normally measures build size.
+        // With a budget enabled, unknown source-group size needs a spillable
+        // join rather than treating lack of measurements as evidence of fit.
+        let source_size_unknown =
+            matches!(build_side.output_partitioning(), Partitioning::Grouped(_))
+                && build_max_partition_bytes.is_none()
+                && max_build_bytes != 0;
+
         // Broadcast eligibility is a property of the build side alone, since that
         // is the side replicated to every probe task. Testing both sides and
         // OR-ing the results would promote the join whenever *either* side fit,
@@ -364,10 +374,14 @@ impl DynamicJoinSelectionExec {
         // the inputs are already co-partitioned there is nothing to wait for,
         // so resolve now instead of inserting an exchange that reshuffles data
         // already in the right place (TPC-H q18 moved 60M rows twice).
-        let selection_state = if self.selection_state == JoinInputState::Repartitioned
-            || self.inputs_already_partitioned(config)
-        {
+        let selection_state = if self.selection_state == JoinInputState::Repartitioned {
             JoinInputState::Repartitioned
+        } else if self.inputs_already_partitioned(config) {
+            if matches!(self.left.output_partitioning(), Partitioning::Grouped(_)) {
+                JoinInputState::SourcePartitioned
+            } else {
+                JoinInputState::Repartitioned
+            }
         } else {
             JoinInputState::Unknown
         };
@@ -377,9 +391,10 @@ impl DynamicJoinSelectionExec {
             // upper bound, so it is no basis for a broadcast. Measure the build
             // side first and decide on its real size; without staging, fall
             // back to shuffling both sides.
-            (JoinInputState::Unknown, PartitionMode::CollectLeft)
-                if !self.null_aware && size_estimated_through_join(build_side) =>
-            {
+            (
+                JoinInputState::Unknown | JoinInputState::SourcePartitioned,
+                PartitionMode::CollectLeft,
+            ) if !self.null_aware && size_estimated_through_join(build_side) => {
                 if bc.stage_build_side_enabled()
                     && !self.left.is::<ExchangeExec>()
                     && !self.right.is::<ExchangeExec>()
@@ -393,7 +408,10 @@ impl DynamicJoinSelectionExec {
                     )))
                 }
             }
-            (JoinInputState::Unknown, PartitionMode::CollectLeft) => self
+            (
+                JoinInputState::Unknown | JoinInputState::SourcePartitioned,
+                PartitionMode::CollectLeft,
+            ) => self
                 .to_hash_join(PartitionMode::CollectLeft)
                 .map(JoinSelectionAction::CollectLeft),
             // Null-aware anti joins require single-task `CollectLeft` even
@@ -404,16 +422,20 @@ impl DynamicJoinSelectionExec {
                 self.to_hash_join(PartitionMode::CollectLeft)
                     .map(JoinSelectionAction::LateCollectLeft)
             }
-            // Both inputs are already shuffled, so broadcasting would pay for
-            // the shuffle and the broadcast. Decide hash-vs-sort on build fit.
+            // Materialized inputs have already paid for their shuffle. Source
+            // groups reach this arm only when broadcast was not selected above.
+            // Choose the partitioned join algorithm from the build-size budget.
             (
-                JoinInputState::Repartitioned,
+                JoinInputState::Repartitioned | JoinInputState::SourcePartitioned,
                 PartitionMode::Partitioned | PartitionMode::CollectLeft,
-            ) if hash_build_fits(max_build_bytes, build_max_partition_bytes) => self
-                .to_hash_join(PartitionMode::Partitioned)
-                .map(JoinSelectionAction::Hash),
+            ) if !source_size_unknown
+                && hash_build_fits(max_build_bytes, build_max_partition_bytes) =>
+            {
+                self.to_hash_join(PartitionMode::Partitioned)
+                    .map(JoinSelectionAction::Hash)
+            }
             (
-                JoinInputState::Repartitioned,
+                JoinInputState::Repartitioned | JoinInputState::SourcePartitioned,
                 PartitionMode::Partitioned | PartitionMode::CollectLeft,
             ) => self.to_sort_merge_join().map(JoinSelectionAction::Sort),
             (JoinInputState::Unknown, PartitionMode::Partitioned) => {
@@ -557,6 +579,26 @@ impl DynamicJoinSelectionExec {
     /// key, so a downstream join on the other key is already co-partitioned.
     /// `satisfaction` consults equivalence classes and sees that.
     fn inputs_already_partitioned(&self, config: &ConfigOptions) -> bool {
+        if matches!(self.left.output_partitioning(), Partitioning::Grouped(_))
+            || matches!(self.right.output_partitioning(), Partitioning::Grouped(_))
+        {
+            if self.join_type != JoinType::Inner
+                || self.null_aware
+                || self.null_equality != NullEquality::NullEqualsNothing
+            {
+                return false;
+            }
+            let requirements =
+                datafusion::physical_plan::InputDistributionRequirements::co_partitioned(
+                    self._required_input_distribution(),
+                );
+            return requirements
+                .unsatisfied_co_partitioned_children(
+                    self.name(),
+                    &[self.left.as_ref(), self.right.as_ref()],
+                )
+                .is_ok_and(|children| children.is_empty());
+        }
         let partitions = config.execution.target_partitions;
         self._required_input_distribution()
             .iter()
@@ -786,13 +828,30 @@ fn hash_build_fits(
 /// `ballista.planner.coalesce.enabled` is `false` by default, so the gap is
 /// inert unless coalescing is explicitly turned on.
 ///
-/// Returns `None` (callers treat this as "fits", not as a forced fallback)
+/// Source groups use provider-supplied per-partition byte estimates; unknown
+/// source size selects a spillable join when the build budget is enabled.
+/// For other inputs, returns `None` (the existing "fits" policy)
 /// when `build` isn't an `ExchangeExec`, its shuffle hasn't resolved yet, or
 /// the resolved shuffle has no partitions at all. A resolved shuffle whose
 /// partitions are missing byte-size stats is not `None`: each such partition
 /// contributes 0 bytes, so the result is `Some(0)` (or higher, if other
 /// partitions do report sizes) — still small enough to be treated as fitting.
 fn max_per_partition_build_bytes(build: &Arc<dyn ExecutionPlan>) -> Option<usize> {
+    if matches!(build.output_partitioning(), Partitioning::Grouped(_)) {
+        let context = StatisticsContext::new();
+        return (0..build.output_partitioning().partition_count()).try_fold(
+            0,
+            |largest, partition| {
+                let stats = context
+                    .compute(
+                        build.as_ref(),
+                        &StatisticsArgs::new().with_partition(Some(partition)),
+                    )
+                    .ok()?;
+                Some(largest.max(*stats.total_byte_size.get_value()?))
+            },
+        );
+    }
     let exchange = build.downcast_ref::<ExchangeExec>()?;
     let partitions = exchange.shuffle_partitions()?;
     partitions
