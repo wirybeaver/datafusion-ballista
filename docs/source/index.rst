@@ -84,6 +84,7 @@ Table of content
    contributors-guide/code-organization
    contributors-guide/user-personas
    contributors-guide/development
+   contributors-guide/storage-partition-join-roadmap
    contributors-guide/benchmarking/index
    Source code <https://github.com/apache/datafusion-ballista/>
 

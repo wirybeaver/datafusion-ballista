@@ -52,6 +52,13 @@ position, so a four-bucket manifest has five execution groups even when some
 are empty. Projecting away the key drops the partition guarantee and still
 allows the query to execute.
 
+The adapter's versioned scheme also defines group identity encoding:
+`bucket_group_id` uses four-byte unsigned big-endian labels for non-null
+buckets and an empty byte vector for the null group. Providers exposing this
+same scheme must use that convention. Other identity encodings require
+distinct scheme identifiers; divisor normalization needs an adapter for the
+encoding in use. Identical opaque layouts can still use equal-layout SPJ.
+
 The manifest supplies the registered object-store URL, key name, bucket count,
 and each file's object path, exact byte length, optional exact row count, and
 bucket label. A minimal construction is:
@@ -95,6 +102,9 @@ let config = SessionConfig::new_with_ballista()
     .set_bool("ballista.optimizer.storage_partition_join_divisor", true);
 ```
 
+SPJ requires both adaptive planning and adaptive join selection. Disabling
+either retains ordinary scan partitioning and reports the reason in `EXPLAIN`.
+
 The production AQE planner aligns ordinary inner equi-joins on the supported
 bucketing key before it creates exchanges. It uses the existing Hash Join or
 Sort-Merge Join selection; source-provided per-group row counts allow the
@@ -123,6 +133,10 @@ The provider reports whole-scan as well as per-group statistics. A known-small
 build remains eligible for the existing broadcast policy; that decision is
 checked before regrouping the probe, preserving its original parallelism.
 Source grouping is distinct from a join that already requested a shuffle.
+It also does not make an unexecuted join's output size measured. AQE measures
+such a build before considering broadcast, or repartitions when build staging
+is disabled. EXPLAIN reports that policy choice; when a child join is still
+unresolved, it reports the deferred storage-group decision.
 
 `EXPLAIN` uses the initial AQE plan when adaptive planning is enabled. Its
 `distributed_plan` row includes each join's storage-group decision, scheme,
@@ -140,6 +154,30 @@ preserves ordered exchanges because concatenating their sorted partitions
 would lose the advertised ordering. Native unordered downstream shuffles
 remain eligible for ordinary coalescing.
 
+## Bucket affinity
+
+For push scheduling, choose:
+
+```text
+ballista-scheduler --scheduler-policy push-staged --task-distribution bucket-affinity
+ballista-executor --task-scheduling-policy push-staged ...
+```
+
+Affinity uses a deterministic rendezvous preference derived from the actual
+source inventory, normalized group identity, and executor ID. The immutable
+source/group keys are prepared once per running stage; executor membership
+and free capacity are evaluated again on every scheduling round. The entire
+aligned group is one scheduling unit. A saturated preferred executor causes an
+immediate eligible-capacity fallback; losing an executor changes placement,
+not the group's input files or retry identity. The existing task-attempt and
+resource-accounting machinery remains responsible for retries.
+
+Affinity is advisory. `bias` and `round-robin` remain valid baselines. Pull
+scheduling only exposes the requesting executor to task binding, so this policy
+explicitly falls back to ordinary capacity scheduling there. It does not claim
+cross-executor affinity in pull mode. No new cache service or persistent
+bucket-to-executor assignment is introduced.
+
 ## Inspect and validate
 
 `EXPLAIN` shows `Grouped(scheme, group_ids, count)` on eligible scans. In a
@@ -148,10 +186,14 @@ usual exchange remains. Grouped properties are distinct from native hash
 routing, including after projection and downstream joins. Partition-dependent
 dynamic filtering is conservatively disabled for multi-group source joins.
 
-Enable the storage-join optimizer's debug log to see divisor alignment and
-fallback decisions. `EXPLAIN ANALYZE`
+Enable `ballista_scheduler::cluster=DEBUG` to see preferred/actual affinity
+placement and capacity fallback reasons. Enable the storage-join optimizer's
+debug log to see divisor alignment and fallback decisions. `EXPLAIN ANALYZE`
 provides ordinary scan, join, and shuffle metrics. Storage reads and shuffle
 traffic are separate costs.
+
+Affinity diagnostics distinguish `preferred-capacity-exhausted` from
+`preferred-ineligible`, while keeping the complete normalized group intact.
 
 The integration fixture uses real Parquet data, duplicate keys, nulls,
 asymmetric empty buckets, several files per group, both join algorithms,
@@ -165,6 +207,7 @@ For measurements, build the binaries and integration test using
 
 ```bash
 uv run dev/test_storage_partition_join.py --profile release-nonlto --benchmark --policy bias
+uv run dev/test_storage_partition_join.py --profile release-nonlto --benchmark --policy bucket-affinity
 ```
 
 The benchmark alternates SPJ off/on visits on identical input files and reports
@@ -212,7 +255,4 @@ disk-controller caches or change executor runtime reuse. The Q12 benchmark
 also tests a 32/2 layout that reduces join parallelism below the four available
 executor slots. `job-stages.json` retains the existing scheduler's task-duration
 and input-row distributions for each job; visit records include job IDs for
-correlation. The [equal-layout checkpoint](../contributors-guide/benchmarking/storage-partition-join-equal.md) records the prerequisite baseline.
-
-Divisor grouping is implemented in this branch. Bucket affinity and the
-combined divisor/affinity acceptance remain required in the next stack layer.
+correlation. See the [controlled cache results](../contributors-guide/benchmarking/storage-partition-join-cache.md).

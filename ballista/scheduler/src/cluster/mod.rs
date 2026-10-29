@@ -15,6 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
+mod bucket_affinity;
+
 use crate::cluster::memory::{
     InMemoryCacheState, InMemoryClusterState, InMemoryJobState,
 };
@@ -539,6 +541,7 @@ fn bind_one(
     session_id: &str,
     job_id: &JobId,
     budget: &mut AvailableVcores,
+    partition_limit: usize,
 ) -> Option<BoundTask> {
     let is_collapse = stage_has_input_collapse(&running_stage.plan);
     // Cap non-collapse slices at the configured `max_partitions_per_task`.
@@ -556,7 +559,7 @@ fn bind_one(
     let max_partitions = if is_collapse {
         usize::MAX
     } else {
-        (budget.vcores as usize).min(cap)
+        (budget.vcores as usize).min(cap).min(partition_limit)
     };
     let input_partition_ids = running_stage.pending.next_slice(max_partitions);
     if input_partition_ids.is_empty() {
@@ -664,7 +667,13 @@ pub(crate) async fn bind_task_bias(
                 if idx >= budgets.len() {
                     return schedulable_tasks;
                 }
-                match bind_one(running_stage, &session_id, job_id, &mut *budgets[idx]) {
+                match bind_one(
+                    running_stage,
+                    &session_id,
+                    job_id,
+                    &mut *budgets[idx],
+                    usize::MAX,
+                ) {
                     Some(bound) => schedulable_tasks.push(bound),
                     None => break, // stage's pending is drained
                 }
@@ -719,7 +728,13 @@ pub(crate) async fn bind_task_round_robin(
                         return schedulable_tasks;
                     }
                 }
-                match bind_one(running_stage, &session_id, job_id, &mut *budgets[idx]) {
+                match bind_one(
+                    running_stage,
+                    &session_id,
+                    job_id,
+                    &mut *budgets[idx],
+                    usize::MAX,
+                ) {
                     Some(bound) => {
                         schedulable_tasks.push(bound);
                         idx = (idx + 1) % budgets.len();

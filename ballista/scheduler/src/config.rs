@@ -157,7 +157,7 @@ pub struct Config {
         help = "Delayed interval for cleaning up finished job state."
     )]
     pub finished_job_state_clean_up_interval_seconds: u64,
-    /// Task distribution policy (bias, round-robin).
+    /// Task distribution policy (bias, round-robin, bucket-affinity).
     #[arg(
         long,
         default_value_t = crate::config::TaskDistribution::default(),
@@ -860,6 +860,8 @@ pub enum TaskDistribution {
     /// Distribute tasks evenly across executors. This will try and iterate through available executors
     /// and assign one task to each executor until all tasks are assigned.
     RoundRobin,
+    /// Prefer deterministic executors for storage groups, with capacity fallback.
+    BucketAffinity,
 }
 
 impl Display for TaskDistribution {
@@ -867,6 +869,7 @@ impl Display for TaskDistribution {
         match self {
             TaskDistribution::Bias => f.write_str("bias"),
             TaskDistribution::RoundRobin => f.write_str("round-robin"),
+            TaskDistribution::BucketAffinity => f.write_str("bucket-affinity"),
         }
     }
 }
@@ -890,6 +893,8 @@ pub enum TaskDistributionPolicy {
     /// Distribute tasks evenly across executors. This will try and iterate through available executors
     /// and assign one task to each executor until all tasks are assigned.
     RoundRobin,
+    /// Prefer deterministic executors for storage groups, with capacity fallback.
+    BucketAffinity,
     /// User provided task distribution policy
     Custom(Arc<dyn DistributionPolicy>),
 }
@@ -903,6 +908,7 @@ impl TryFrom<Config> for SchedulerConfig {
         let task_distribution = match opt.task_distribution {
             TaskDistribution::Bias => TaskDistributionPolicy::Bias,
             TaskDistribution::RoundRobin => TaskDistributionPolicy::RoundRobin,
+            TaskDistribution::BucketAffinity => TaskDistributionPolicy::BucketAffinity,
         };
 
         // Backward compatibility: a bare `--advertise-flight-endpoint` (empty value) used

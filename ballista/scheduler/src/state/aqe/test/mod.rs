@@ -19,6 +19,8 @@
 mod alter_stages;
 /// Broadcast-threshold decisions over declared statistics
 mod broadcast_thresholds;
+/// Placement and retry of normalized storage groups
+mod bucket_affinity;
 /// Functional tests for the CoalescePartitionsRule end-to-end through the planner
 mod coalesce_rule;
 /// Job-failure lifecycle tests for the adaptive graph

@@ -78,10 +78,19 @@ impl ClusterState for InMemoryClusterState {
     ) -> Result<Vec<BoundTask>> {
         let mut guard = self.available_vcores.lock().await;
 
+        // Placement preference uses stable membership, not just the executors
+        // whose capacity this scheduling event is allowed to consume.
+        let affinity_members =
+            if matches!(distribution, TaskDistributionPolicy::BucketAffinity) {
+                guard.keys().cloned().collect()
+            } else {
+                Vec::new()
+            };
         let budgets: Vec<&mut AvailableVcores> = guard
             .values_mut()
             .filter_map(|data| {
-                (data.vcores > 0
+                ((data.vcores > 0
+                    || matches!(distribution, TaskDistributionPolicy::BucketAffinity))
                     && executors
                         .as_ref()
                         .map(|executors| executors.contains(&data.executor_id))
@@ -96,6 +105,10 @@ impl ClusterState for InMemoryClusterState {
             }
             TaskDistributionPolicy::RoundRobin => {
                 bind_task_round_robin(budgets, active_jobs, |_| false).await
+            }
+            TaskDistributionPolicy::BucketAffinity => {
+                super::bucket_affinity::bind_tasks(budgets, active_jobs, affinity_members)
+                    .await
             }
             TaskDistributionPolicy::Custom(ref policy) => {
                 policy.bind_tasks(budgets, active_jobs).await?
