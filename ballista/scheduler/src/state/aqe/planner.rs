@@ -592,6 +592,11 @@ impl AdaptivePlanner {
             // before DataFusion's own chain so its file-scan repartitioning
             // sees the pruned files.
             Arc::new(BalanceAndPruneFileGroups::new()),
+            Arc::new(
+                super::optimizer_rule::runtime_filter::RuntimeFilterRule::new(
+                    plan_id_generator.clone(),
+                ),
+            ),
             Arc::new(DelayJoinSelectionRule::new(plan_id_generator)),
             Arc::new(ChaosCreatingRule::default()),
         ]

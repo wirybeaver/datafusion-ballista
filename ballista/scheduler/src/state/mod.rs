@@ -235,6 +235,18 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> SchedulerState<T,
                 .bind_schedulable_tasks(self.task_manager.get_running_job_cache())
                 .await?,
         );
+        for deadline in self.task_manager.take_runtime_filter_deadlines().await {
+            let sender = sender.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep_until(deadline).await;
+                if let Err(error) = sender
+                    .post_event(QueryStageSchedulerEvent::ReviveOffers)
+                    .await
+                {
+                    log::debug!("Runtime filter timeout wake failed: {error}");
+                }
+            });
+        }
         if schedulable_tasks.is_empty() {
             debug!("No schedulable tasks found to be launched");
             return Ok(());
