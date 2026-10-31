@@ -182,7 +182,8 @@ only filters that are already available.
 Each filter carries an 8 KiB Bloom summary, an IN summary of up to 128 key hashes,
 and optional MinMax bounds. Large MinMax values are omitted to keep reports
 bounded. Key hashing operates on Arrow batches; collisions retain extra candidates
-for the join to check. `EXPLAIN ANALYZE` shows `RuntimeFilterBuildExec`,
+for the join to check. MinMax bounds are also pushed into eligible Parquet scans
+for row-group pruning. `EXPLAIN ANALYZE` shows `RuntimeFilterBuildExec`,
 `RuntimeFilterApplyExec`, and `rows_pruned` metrics.
 
 Filters currently cover the first direct-column equality key of inner and semi

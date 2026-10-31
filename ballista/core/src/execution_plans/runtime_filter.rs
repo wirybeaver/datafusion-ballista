@@ -406,6 +406,46 @@ impl RuntimeFilterApplyExec {
             metrics: ExecutionPlanMetricsSet::new(),
         })
     }
+    /// A conservative SQL range predicate for scan pruning. The Bloom test
+    /// remains here for row filtering; scans may use min/max statistics
+    /// without reading the data pages. Preserve NULL for null-safe joins.
+    pub fn pruning_predicate(&self) -> Option<Arc<dyn PhysicalExpr>> {
+        use datafusion::logical_expr::Operator;
+        use datafusion::physical_expr::expressions::{BinaryExpr, IsNullExpr, Literal};
+        let filter = self.filter.as_ref()?;
+        let predicate: Arc<dyn PhysicalExpr> = if let Some((min, max)) = &filter.bounds {
+            Arc::new(BinaryExpr::new(
+                Arc::new(BinaryExpr::new(
+                    self.key.clone(),
+                    Operator::GtEq,
+                    Arc::new(Literal::new(min.clone())),
+                )),
+                Operator::And,
+                Arc::new(BinaryExpr::new(
+                    self.key.clone(),
+                    Operator::LtEq,
+                    Arc::new(Literal::new(max.clone())),
+                )),
+            ))
+        } else if filter
+            .in_hashes
+            .as_ref()
+            .is_some_and(|values| values.is_empty())
+        {
+            Arc::new(Literal::new(ScalarValue::Boolean(Some(false))))
+        } else {
+            return None;
+        };
+        if filter.has_null {
+            Some(Arc::new(BinaryExpr::new(
+                predicate,
+                Operator::Or,
+                Arc::new(IsNullExpr::new(self.key.clone())),
+            )))
+        } else {
+            Some(predicate)
+        }
+    }
 }
 
 impl DisplayAs for RuntimeFilterApplyExec {
