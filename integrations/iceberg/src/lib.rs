@@ -73,8 +73,8 @@ use iceberg_storage_opendal as _;
 
 use crate::catalog::PinningCatalogList;
 
-pub use crate::logical_codec::IcebergLogicalCodec;
-pub use crate::physical_codec::IcebergPhysicalCodec;
+pub use crate::logical_codec::{IcebergLogicalCodec, IcebergProviderAdapter};
+pub use crate::physical_codec::{IcebergPhysicalCodec, IcebergScanAdapter};
 
 /// Readies a client's session for Iceberg: registers the codecs, and pins
 /// each catalog-backed table a query names to the version its catalog serves
@@ -85,8 +85,14 @@ pub fn register_iceberg(mut state: SessionState) -> SessionState {
         return state;
     }
     let config = state.config_mut();
-    let logical = IcebergLogicalCodec::new(config.ballista_logical_extension_codec());
-    let physical = IcebergPhysicalCodec::new(config.ballista_physical_extension_codec());
+    let logical = IcebergLogicalCodec::new(
+        config.ballista_logical_extension_codec(),
+        IcebergProviderAdapter,
+    );
+    let physical = IcebergPhysicalCodec::new(
+        config.ballista_physical_extension_codec(),
+        IcebergScanAdapter,
+    );
     *config = config
         .clone()
         .with_ballista_logical_extension_codec(Arc::new(logical))

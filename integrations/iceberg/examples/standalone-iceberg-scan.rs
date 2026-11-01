@@ -21,7 +21,7 @@
 //! nothing running:
 //!
 //! ```text
-//! cargo run -p ballista-iceberg --example standalone-iceberg-scan
+//! cargo run --manifest-path integrations/iceberg/Cargo.toml --example standalone-iceberg-scan --locked
 //! ```
 
 use std::collections::HashMap;

@@ -162,33 +162,14 @@ impl TableWire {
     }
 }
 
-/// Leads a blob that belongs to this crate, JSON-encoded. Any other blob
-/// belongs to the inner codec and passes through untouched, so codecs for
-/// other formats can be stacked in any order, as long as each has its own
-/// prefix.
-const PREFIX: &[u8] = b"iceberg";
-
-/// Appends `payload` to `buf` as an Iceberg blob.
-pub(crate) fn encode<T: Serialize>(
-    buf: &mut Vec<u8>,
-    payload: &T,
-) -> Result<(), DataFusionError> {
-    buf.extend_from_slice(PREFIX);
-    serde_json::to_writer(buf, payload).map_err(json_err)
+// The SDK-free gate owns the envelope; this crate owns its JSON payload.
+pub(crate) fn encode<T: Serialize>(payload: &T) -> Result<Vec<u8>, DataFusionError> {
+    serde_json::to_vec(payload).map_err(json_err)
 }
 
-/// Decodes `buf` as `T` if it's an Iceberg blob, or returns `None` if it
-/// belongs to the inner codec.
-pub(crate) fn decode<T: DeserializeOwned>(
-    buf: &[u8],
-) -> Result<Option<T>, DataFusionError> {
-    buf.strip_prefix(PREFIX)
-        .map(|rest| {
-            serde_json::from_slice(rest).map_err(|e| {
-                exec_datafusion_err!("invalid ballista-iceberg payload: {e}")
-            })
-        })
-        .transpose()
+pub(crate) fn decode<T: DeserializeOwned>(payload: &[u8]) -> Result<T, DataFusionError> {
+    serde_json::from_slice(payload)
+        .map_err(|e| exec_datafusion_err!("invalid ballista-iceberg payload: {e}"))
 }
 
 fn json_err(e: serde_json::Error) -> DataFusionError {
