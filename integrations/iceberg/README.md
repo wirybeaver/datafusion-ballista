@@ -17,22 +17,31 @@
   under the License.
 -->
 
-# Review baseline for the Iceberg gate demo
+# Iceberg build-gate demo — not for upstream merge
 
-This branch contains the original Iceberg implementation from
-[apache/datafusion-ballista#2638](https://github.com/apache/datafusion-ballista/pull/2638)
-at `86bc19c46df93d707ca40bbaefe1e1cfcbc542f5`, by @NoahKusaba, on top of the
-SDK-free gate proposal. The integration source and tests remain unmodified;
-they still use the original codecs and `iceberg` wire prefix.
+This personal-fork demo adapts [apache/datafusion-ballista#2638](https://github.com/apache/datafusion-ballista/pull/2638)
+at commit `86bc19c46df93d707ca40bbaefe1e1cfcbc542f5` by @NoahKusaba.
+It demonstrates how that integration can use the proposed SDK-free build gate.
+**It does not replace #2638 and is not intended for upstream merge.** The gate
+is the separate upstream merge proposal; Iceberg implementation work remains
+with #2638 and its author.
 
-For the demo comparison, packaging is already independent: this excluded
-workspace has its own manifest, lockfile and CI. Its manifest enables the gate
-feature, but the original implementation does not yet use the adapter interfaces.
-The follow-up demo PR shows only the changes needed to consume that gate.
-Neither this baseline nor the demo replaces upstream #2638.
+This directory is excluded from Ballista's root workspace. All Iceberg SDK pins
+and the integration lockfile live here. The demo uses local Ballista path
+dependencies to exercise the proposed gate before it is released. An independently
+released adapter should instead select compatible published Ballista versions.
+The path dependencies are not evidence of cross-version compatibility.
 
-Run commands from this directory, or pass
-`--manifest-path integrations/iceberg/Cargo.toml` from the repository root.
+From the repository root:
+
+```shell
+cargo check --manifest-path integrations/iceberg/Cargo.toml --all-targets --locked
+cargo test --manifest-path integrations/iceberg/Cargo.toml --locked
+```
+
+Tests preserve #2638's snapshot/projection/filter/fetch round trip, catalog
+pinning, standalone reads, Flight SQL reads, and inner-codec delegation. The
+Docker/S3 tests remain opt-in via `--features testcontainers`.
 
 # Apache Iceberg
 
@@ -78,7 +87,7 @@ The example registers both on a table in a temporary local warehouse, and shows
 a commit reaching the live table but not the static one:
 
 ```shell
-cargo run -p ballista-iceberg --example standalone-iceberg-scan
+cargo run --manifest-path integrations/iceberg/Cargo.toml --example standalone-iceberg-scan --locked
 ```
 
 ## SQL clients
@@ -131,88 +140,15 @@ scheduler for SQL clients. Executors never need catalog configuration.
 
 ## Combining with other table formats
 
-The Iceberg codecs wrap the codecs a session already has, so one query can
-read Iceberg tables alongside tables of another format, such as Delta or Hudi,
-whose codecs are maintained elsewhere. Any codec that follows the same
-convention can be stacked with these in any order:
+The SDK-free gate owns the `ballista-contrib-iceberg-v1\0` prefix and delegates
+all unhandled operations, including UDFs, to the inner codec. This demo supplies
+`IcebergProviderAdapter` and `IcebergScanAdapter`; its exported codec names are
+type aliases for the gate specialized with those adapters.
 
-1. **Wrap an inner codec.** Take the session's existing codec in the
-   constructor rather than Ballista's default, and pass it everything that
-   isn't yours.
-2. **Prefix your own bytes with a unique name.** Iceberg payloads start with
-   `iceberg`. Choose a name for your format, such as `delta`, that no other
-   codec uses and that doesn't start another codec's name.
-3. **Pass everything else through untouched.** When encoding something that
-   isn't yours, write only what the inner codec writes, without adding a
-   marker. When decoding, if the bytes don't start with your prefix, hand all
-   of them to the inner codec.
-
-A logical codec for a hypothetical Delta integration would look like this:
-
-```rust
-/// Rule 2: the name that starts every payload this codec writes.
-const PREFIX: &[u8] = b"delta";
-
-#[derive(Debug)]
-pub struct DeltaLogicalCodec {
-    inner: Arc<dyn LogicalExtensionCodec>,
-}
-
-impl DeltaLogicalCodec {
-    /// Rule 1: wrap whatever codec the session already has.
-    pub fn new(inner: Arc<dyn LogicalExtensionCodec>) -> Self {
-        Self { inner }
-    }
-}
-
-impl LogicalExtensionCodec for DeltaLogicalCodec {
-    fn try_encode_table_provider(
-        &self,
-        table_ref: &TableReference,
-        node: Arc<dyn TableProvider>,
-        buf: &mut Vec<u8>,
-    ) -> Result<()> {
-        let Some(table) = node.downcast_ref::<DeltaTableProvider>() else {
-            // Rule 3: not ours, so write only what the inner codec writes.
-            return self.inner.try_encode_table_provider(table_ref, node, buf);
-        };
-        buf.extend_from_slice(PREFIX);
-        encode_delta_table(table, buf)
-    }
-
-    fn try_decode_table_provider(
-        &self,
-        buf: &[u8],
-        table_ref: &TableReference,
-        schema: SchemaRef,
-        ctx: &TaskContext,
-    ) -> Result<Arc<dyn TableProvider>> {
-        match buf.strip_prefix(PREFIX) {
-            Some(payload) => decode_delta_table(payload, schema),
-            // Rule 3: not ours, so hand over every byte unchanged.
-            None => self.inner.try_decode_table_provider(buf, table_ref, schema, ctx),
-        }
-    }
-
-    // Every other method forwards to `self.inner`, for example:
-    fn try_decode_udf(&self, name: &str, buf: &[u8]) -> Result<Arc<ScalarUDF>> {
-        self.inner.try_decode_udf(name, buf)
-    }
-    // ...
-}
-```
-
-A physical codec follows the same pattern in `try_encode` and `try_decode`
-for its scan. Because each codec only claims bytes with its own prefix, the
-codecs can be stacked in either order:
-
-```rust
-let logical = IcebergLogicalCodec::new(Arc::new(DeltaLogicalCodec::new(
-    Arc::new(BallistaLogicalExtensionCodec::default()),
-)));
-```
-
-Every node still needs every codec that a query's tables use.
+Construct a wrapper with `IcebergLogicalCodec::new(inner, IcebergProviderAdapter)`
+or `IcebergPhysicalCodec::new(inner, IcebergScanAdapter)`. Registration wraps the
+session's existing codecs. Every participating node must install the same
+compatible adapter. The wire envelope differs from #2638's `iceberg` prefix.
 
 ## Limitations
 
@@ -234,7 +170,7 @@ Every node still needs every codec that a query's tables use.
 - **A separately deployed scheduler and executors** must link
   `ballista-iceberg` and set the Iceberg codecs as their
   `override_logical_codec` and `override_physical_codec` (see
-  [Extending Components](extending-components.md)). The tests cover standalone
+  [Extending Components](../../docs/source/user-guide/extending-components.md)). The tests cover standalone
   mode and an in-process scheduler serving Flight SQL.
 - **A mounted catalog lists its tables once.** `IcebergCatalogProvider` reads
   the table names when it is built, so a table created afterwards isn't

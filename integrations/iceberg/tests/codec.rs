@@ -180,7 +180,10 @@ mod iceberg_nodes {
 mod other_nodes {
     use std::sync::Arc;
 
-    use ballista_iceberg::{IcebergLogicalCodec, IcebergPhysicalCodec};
+    use ballista_iceberg::{
+        IcebergLogicalCodec, IcebergPhysicalCodec, IcebergProviderAdapter,
+        IcebergScanAdapter,
+    };
     use datafusion::arrow::datatypes::Schema;
     use datafusion::catalog::TableProvider;
     use datafusion::common::{Result, TableReference};
@@ -263,7 +266,7 @@ mod other_nodes {
         let ctx = TaskContext::default();
         let schema = Arc::new(Schema::empty());
 
-        let physical = IcebergPhysicalCodec::new(Arc::new(Inner));
+        let physical = IcebergPhysicalCodec::new(Arc::new(Inner), IcebergScanAdapter);
         let mut buf = Vec::new();
         let plan = Arc::new(EmptyExec::new(schema.clone()));
         physical.try_encode(plan, &mut buf, &DefaultPhysicalProtoConverter {})?;
@@ -275,7 +278,7 @@ mod other_nodes {
             "EmptyExec\n"
         );
 
-        let logical = IcebergLogicalCodec::new(Arc::new(Inner));
+        let logical = IcebergLogicalCodec::new(Arc::new(Inner), IcebergProviderAdapter);
         let table = TableReference::bare("t");
         let mut buf = Vec::new();
         let provider = Arc::new(EmptyTable::new(schema.clone()));
@@ -293,9 +296,9 @@ mod other_nodes {
 
     #[test]
     fn should_reject_malformed_payload() {
-        let err = IcebergPhysicalCodec::new(Arc::new(Inner))
+        let err = IcebergPhysicalCodec::new(Arc::new(Inner), IcebergScanAdapter)
             .try_decode(
-                b"iceberginner",
+                b"ballista-contrib-iceberg-v1\0inner",
                 &[],
                 &TaskContext::default(),
                 &DefaultPhysicalProtoConverter {},
