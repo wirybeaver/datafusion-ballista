@@ -1,0 +1,66 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+[package]
+name = "ballista-iceberg"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+license = "Apache-2.0"
+description = "Demo of PR #2638 using Ballista's SDK-free Iceberg build gate"
+readme = "README.md"
+publish = false
+
+[workspace]
+resolver = "3"
+
+[package.metadata.cargo-machete]
+ignored = ["arrow-schema"]
+
+[dependencies]
+arrow-schema = { version = "59.2.0", features = ["serde"] }
+async-trait = "0.1"
+ballista-core = { path = "../../ballista/core", features = ["contrib-iceberg"] }
+datafusion = "55"
+datafusion-proto = "55"
+futures = "0.3"
+iceberg = { git = "https://github.com/apache/iceberg-rust", rev = "5b82ab99aeaf50bf4f5b3b776ac9cd6380a5f3e3" }
+iceberg-datafusion = { git = "https://github.com/apache/datafusion-iceberg", rev = "b641e5ebe9e92967499ae7e440ba10d7797712df" }
+iceberg-storage-opendal = { git = "https://github.com/apache/iceberg-rust", rev = "5b82ab99aeaf50bf4f5b3b776ac9cd6380a5f3e3" }
+serde = { version = "1", features = ["derive", "rc"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread"] }
+
+[dev-dependencies]
+arrow-flight = { version = "59.2.0", features = ["flight-sql-experimental"] }
+ballista = { path = "../../ballista/client", features = ["standalone"] }
+ballista-executor = { path = "../../ballista/executor" }
+ballista-scheduler = { path = "../../ballista/scheduler", features = ["flight-sql"] }
+iceberg-catalog-rest = { git = "https://github.com/apache/iceberg-rust", rev = "5b82ab99aeaf50bf4f5b3b776ac9cd6380a5f3e3" }
+tempfile = "3"
+testcontainers = { version = "0.28", features = ["http_wait_plain"] }
+tokio = { version = "1", features = ["macros"] }
+tonic = "0.14"
+
+[features]
+testcontainers = []
+
+[profile.dev]
+debug = 0
+
+[profile.test]
+debug = 0
