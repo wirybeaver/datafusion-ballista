@@ -136,6 +136,7 @@ standard DataFusion settings.
 | ballista.planner.parallel_window.enabled                  | Boolean | false                         | Enables the AQE parallel-window rule (ParallelWindowRule), which rewrites bounded-RANGE-frame windows into a distributed range-shuffle so BoundedWindowAggExec's single-partition constraint is not a serial bottleneck. Disabled by default — opt in when the workload contains matching window shapes.                                                                                                                                                                               |
 | ballista.planner.propagate_empty.enabled                  | Boolean | true                          | Enables the AQE propagate-empty-relation rule. Injects EmptyExec into the plan where an input is known to be empty, such as one side of a join, allowing downstream work to be skipped.                                                                                                                                                                                                                                                                                                |
 | ballista.planner.runtime_filter.enabled                   | Boolean | false                         | Enables bounded distributed runtime filters for AQE inner and semi hash joins.                                                                                                                                                                                                                                                                                                                                                                                                         |
+| ballista.planner.runtime_filter.wait_timeout_ms           | UInt64  | 0                             | Maximum probe-stage wait for all build-side runtime filters, in milliseconds. Zero disables waiting.                                                                                                                                                                                                                                                                                                                                                                                   |
 | ballista.planner.skew_join.advisory_partition_bytes       | UInt64  | 67108864                      | Advisory target sub-shard byte size used by the bin-packer when splitting a skewed partition.                                                                                                                                                                                                                                                                                                                                                                                          |
 | ballista.planner.skew_join.enabled                        | Boolean | false                         | Enables the AQE optimize-skewed-join rule (Spark's OptimizeSkewedJoin). Disabled by default — opt in for workloads where per-key skew creates straggler tasks on join inputs. Requires datafusion.optimizer.enable_dynamic_filter_pushdown=false.                                                                                                                                                                                                                                      |
 | ballista.planner.skew_join.partition_threshold_bytes      | UInt64  | 268435456                     | Absolute byte threshold below which a partition is never split (Spark's skewedPartitionThresholdInBytes).                                                                                                                                                                                                                                                                                                                                                                              |
@@ -173,8 +174,15 @@ SET ballista.planner.runtime_filter.enabled = true;
 ```
 
 Filters use the first join key when it is a supported column, including NULL-safe
-equality. Probe stages never wait: complete reports are used, otherwise bypassed.
+equality. By default, stages use complete reports immediately and otherwise bypass.
 Filters do not cross LIMIT or aggregates. `EXPLAIN ANALYZE` shows `rows_pruned`.
+
+### Optional runtime-filter waiting
+
+Set `ballista.planner.runtime_filter.wait_timeout_ms` (default `0`) to a nonzero
+value to wait for complete reports without reserving executor slots. At the
+deadline, or if a partial Bloom is already saturated, the probe proceeds with
+available complete filters.
 
 ## Shuffle Settings
 
