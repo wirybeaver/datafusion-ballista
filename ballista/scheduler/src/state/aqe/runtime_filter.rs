@@ -53,6 +53,7 @@ impl RuntimeFilterRegistry {
         stage_id: usize,
         plan: Arc<dyn ExecutionPlan>,
         stages: &HashMap<usize, ExecutionStage>,
+        config: &datafusion::config::ConfigOptions,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         // Binding is attempted once, including when the caller falls back
         // after an invalid report. Later tasks must keep the same stage plan.
@@ -73,11 +74,45 @@ impl RuntimeFilterRegistry {
                 else {
                     return Ok(Transformed::yes(apply.children()[0].clone()));
                 };
-                Ok(Transformed::yes(Arc::new(apply.with_payload(payload)?)))
+                Ok(Transformed::yes(specialize_apply(apply, payload, config)?))
             })?
             .data;
         Ok(plan)
     }
+}
+
+fn specialize_apply(
+    apply: &RuntimeFilterApplyExec,
+    payload: RuntimeFilterPayload,
+    config: &datafusion::config::ConfigOptions,
+) -> Result<Arc<dyn ExecutionPlan>> {
+    let apply = Arc::new(apply.with_payload(payload)?);
+    let child = apply.children()[0].clone();
+    // Optimize only this newly introduced predicate over its scan.
+    // Re-running filter pushdown over an entire AQE stage would append
+    // already-pushed static predicates on every replan.
+    use datafusion::datasource::physical_plan::{FileScanConfig, ParquetSource};
+    use datafusion::datasource::source::DataSourceExec;
+    use datafusion::physical_optimizer::PhysicalOptimizerRule;
+    use datafusion::physical_plan::filter::FilterExec;
+    let parquet = child
+        .downcast_ref::<DataSourceExec>()
+        .and_then(|scan| scan.data_source().downcast_ref::<FileScanConfig>())
+        .is_some_and(|scan| {
+            scan.limit.is_none()
+                && scan.file_source.downcast_ref::<ParquetSource>().is_some()
+        });
+    if parquet && let Some(predicate) = apply.pruning_predicate() {
+        let scan: Arc<dyn ExecutionPlan> =
+            Arc::new(FilterExec::try_new(predicate, child)?);
+        let scan = crate::physical_optimizer::filter_pushdown::FilterPushdown::new()
+            .optimize(scan, config)?;
+        return datafusion::physical_plan::replace_children_if_necessary(
+            apply,
+            vec![scan],
+        );
+    }
+    Ok(apply as Arc<dyn ExecutionPlan>)
 }
 
 fn completed_filter(
@@ -206,7 +241,9 @@ mod tests {
         );
         let mut hub = RuntimeFilterRegistry::default();
         hub.register(1, stages[&1].plan());
-        let bypass = hub.prepare(2, probe.clone(), &stages).unwrap();
+        let bypass = hub
+            .prepare(2, probe.clone(), &stages, &Default::default())
+            .unwrap();
         assert_eq!(keys(bypass.clone()).await, [1, 2, 3, 4]);
         let ExecutionStage::Running(stage) = stages.get_mut(&1).unwrap() else {
             unreachable!()
@@ -217,9 +254,11 @@ mod tests {
         stage.pending.next_slice(1);
         stage.task_infos.push(task(2, 0, Some(report(3).await)));
         // A stage already dispatched without a filter stays unchanged.
-        let frozen = hub.prepare(2, bypass, &stages).unwrap();
+        let frozen = hub
+            .prepare(2, bypass, &stages, &Default::default())
+            .unwrap();
         assert_eq!(keys(frozen).await, [1, 2, 3, 4]);
-        let plan = hub.prepare(3, probe, &stages).unwrap();
+        let plan = hub.prepare(3, probe, &stages, &Default::default()).unwrap();
         assert_eq!(keys(plan).await, [2, 3]);
     }
 }

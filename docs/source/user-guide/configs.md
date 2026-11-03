@@ -175,6 +175,7 @@ SET ballista.planner.runtime_filter.enabled = true;
 Filters use the first join key when it is a supported column, including NULL-safe
 equality. Probe stages never wait: complete reports are used, otherwise bypassed.
 Filters do not cross LIMIT or aggregates. `EXPLAIN ANALYZE` shows `rows_pruned`.
+Complete MinMax bounds can also prune eligible Parquet row groups.
 
 ## Shuffle Settings
 
