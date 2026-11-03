@@ -199,8 +199,12 @@ impl AdaptiveExecutionGraph {
             .get::<ballista_core::config::BallistaConfig>();
         let runtime_filters = filter_config
             .filter(|config| config.runtime_filter_enabled())
-            .map(|_| {
-                let mut registry = runtime_filter::RuntimeFilterRegistry::default();
+            .map(|config| {
+                let mut registry = runtime_filter::RuntimeFilterRegistry::new(
+                    std::time::Duration::from_millis(
+                        config.runtime_filter_wait_timeout_ms() as u64,
+                    ),
+                );
                 for (&id, stage) in &stages {
                     registry.register(id, stage.plan());
                 }
@@ -603,36 +607,56 @@ impl AdaptiveExecutionGraph {
     }
 
     fn get_running_stage_id(&mut self, black_list: &[usize]) -> Option<usize> {
-        let mut running_stage_id = self.stages.iter().find_map(|(stage_id, stage)| {
-            if black_list.contains(stage_id) {
-                None
-            } else if let ExecutionStage::Running(stage) = stage {
-                if stage.available_tasks() > 0 {
-                    Some(*stage_id)
-                } else {
-                    None
+        let mut running_stage_id = None;
+        if let Some(registry) = &mut self.runtime_filters {
+            let candidates = self
+                .stages
+                .iter()
+                .filter_map(|(&id, stage)| match stage {
+                    ExecutionStage::Running(stage)
+                        if !black_list.contains(&id) && stage.available_tasks() > 0 =>
+                    {
+                        Some(id)
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            let now = tokio::time::Instant::now();
+            for id in candidates {
+                let ExecutionStage::Running(stage) = &self.stages[&id] else {
+                    unreachable!()
+                };
+                let plan = stage.plan.clone();
+                let prepared = match registry.prepare(id, plan.clone(), &self.stages, now)
+                {
+                    Ok(prepared) => prepared,
+                    Err(error) => {
+                        log::warn!(
+                            "Runtime filter unavailable for stage {id}; bypassing: {error}"
+                        );
+                        registry.mark_prepared(id);
+                        Some(plan)
+                    }
+                };
+                if let Some(plan) = prepared {
+                    let Some(ExecutionStage::Running(stage)) = self.stages.get_mut(&id)
+                    else {
+                        unreachable!()
+                    };
+                    stage.plan = plan;
+                    running_stage_id = Some(id);
+                    break;
                 }
-            } else {
-                None
             }
-        });
-
-        if let (Some(id), Some(registry)) = (running_stage_id, &mut self.runtime_filters)
-        {
-            let plan = self.stages[&id].plan_arc();
-            let prepared = match registry.prepare(id, plan.clone(), &self.stages) {
-                Ok(plan) => plan,
-                Err(error) => {
-                    log::warn!(
-                        "Runtime filter unavailable for stage {id}; bypassing: {error}"
-                    );
-                    plan
+        } else {
+            running_stage_id = self.stages.iter().find_map(|(&id, stage)| match stage {
+                ExecutionStage::Running(stage)
+                    if !black_list.contains(&id) && stage.available_tasks() > 0 =>
+                {
+                    Some(id)
                 }
-            };
-            let ExecutionStage::Running(stage) = self.stages.get_mut(&id).unwrap() else {
-                unreachable!()
-            };
-            stage.plan = prepared;
+                _ => None,
+            });
         }
 
         // If no available tasks found in the running stage,
@@ -1306,6 +1330,13 @@ impl ExecutionGraph for AdaptiveExecutionGraph {
                 }
             })
             .collect::<Vec<RunningTaskInfo>>()
+    }
+
+    fn take_runtime_filter_deadlines(&mut self) -> Vec<tokio::time::Instant> {
+        self.runtime_filters
+            .as_mut()
+            .map(|registry| registry.take_deadlines())
+            .unwrap_or_default()
     }
 
     /// Total number of tasks in this plan that are ready for scheduling

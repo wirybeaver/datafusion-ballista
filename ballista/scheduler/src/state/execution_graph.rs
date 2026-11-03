@@ -139,6 +139,12 @@ pub trait ExecutionGraph: Debug {
     /// Returns the timestamp when this job started execution.
     fn end_time(&self) -> u64;
 
+    /// Take newly registered runtime-filter deadlines, scheduling one wake per
+    /// wait even when no task completes before its timeout.
+    fn take_runtime_filter_deadlines(&mut self) -> Vec<tokio::time::Instant> {
+        Vec::new()
+    }
+
     /// Number of completed stages
     fn completed_stages(&self) -> usize;
 
