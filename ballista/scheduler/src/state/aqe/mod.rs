@@ -681,7 +681,12 @@ impl AdaptiveExecutionGraph {
         if let (Some(id), Some(registry)) = (running_stage_id, &mut self.runtime_filters)
         {
             let plan = self.stages[&id].plan_arc();
-            let prepared = match registry.prepare(id, plan.clone(), &self.stages) {
+            let prepared = match registry.prepare(
+                id,
+                plan.clone(),
+                &self.stages,
+                self.session_config.options(),
+            ) {
                 Ok(plan) => plan,
                 Err(error) => {
                     log::warn!(
