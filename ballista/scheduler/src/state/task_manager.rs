@@ -171,16 +171,28 @@ pub struct JobInfoCache {
     pub execution_graph: Arc<RwLock<ExecutionGraphBox>>,
     /// Cached job status for quick access.
     pub status: Option<job_status::Status>,
+    runtime_filter_wait_enabled: bool,
 }
 
 impl JobInfoCache {
     /// Creates a new `JobInfoCache` from an execution graph.
     pub fn new(graph: ExecutionGraphBox) -> Self {
         let status = graph.status().status.clone();
+        let runtime_filter_wait_enabled = graph
+            .session_config()
+            .options()
+            .extensions
+            .get::<ballista_core::config::BallistaConfig>()
+            .is_some_and(|config| {
+                config.adaptive_query_planner_enabled()
+                    && config.runtime_filter_enabled()
+                    && config.runtime_filter_wait_timeout_ms() > 0
+            });
 
         Self {
             execution_graph: Arc::new(RwLock::new(graph)),
             status,
+            runtime_filter_wait_enabled,
         }
     }
 }
@@ -514,6 +526,22 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> TaskManager<T, U>
             })
             .collect::<HashMap<_, _>>();
         Arc::new(ret)
+    }
+
+    pub(crate) async fn take_runtime_filter_deadlines(
+        &self,
+    ) -> Vec<tokio::time::Instant> {
+        let jobs = self.get_running_job_cache();
+        let mut deadlines = Vec::new();
+        for job in jobs.values().filter(|job| job.runtime_filter_wait_enabled) {
+            deadlines.extend(
+                job.execution_graph
+                    .write()
+                    .await
+                    .take_runtime_filter_deadlines(),
+            );
+        }
+        deadlines
     }
 
     /// Get a list of jobs from the active cache only (running and queued jobs).
