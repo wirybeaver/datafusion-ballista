@@ -42,7 +42,9 @@ use ballista_core::serde::protobuf::{
     FailedJob, FailedTask, JobStatus, ResultLost, RunningJob, SuccessfulJob, TaskStatus,
     job_status, task_status,
 };
-use ballista_core::serde::scheduler::{ExecutorMetadata, PartitionLocation};
+use ballista_core::serde::scheduler::{
+    ExecutorEndpoint, ExecutorMetadata, PartitionLocation,
+};
 use datafusion::common::DataFusionError;
 use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
 use datafusion::execution::context::SessionContext;
@@ -70,6 +72,9 @@ pub(crate) mod coalesce;
 pub(crate) mod execution_plan;
 pub mod optimizer_rule;
 pub mod planner;
+pub(crate) mod reuse_exchange;
+mod runtime_filter;
+mod runtime_filter_planner;
 pub(crate) mod skew_join;
 #[cfg(test)]
 mod test;
@@ -107,6 +112,7 @@ pub(crate) struct AdaptiveExecutionGraph {
     scheduler_id: Option<String>,
     /// Adaptive Planner to be used with this execution graph
     planner: AdaptivePlanner,
+    runtime_filters: Option<runtime_filter::RuntimeFilterRegistry>,
     /// ID for this job
     job_id: JobId,
     /// Job name, can be empty string
@@ -158,13 +164,63 @@ impl AdaptiveExecutionGraph {
         queued_at: u64,
         rules: Option<&dyn AdaptiveRules>,
     ) -> ballista_core::error::Result<Self> {
-        let session_id = ctx.session_id();
-
-        let mut planner =
+        let planner =
             AdaptivePlanner::try_new(ctx, logical_plan, job_id.clone(), rules).await?;
-
         let logical_plan = Some(logical_plan.display_indent().to_string());
 
+        Self::try_new_with_planner(
+            scheduler_id,
+            job_id,
+            job_name,
+            ctx,
+            planner,
+            logical_plan,
+            queued_at,
+        )
+    }
+
+    /// Creates a new `ExecutionGraph` from an already-built physical plan.
+    ///
+    /// The plan is prepared and staged by [`AdaptivePlanner::try_new_from_physical`];
+    /// the graph has no logical plan to display.
+    pub fn try_new_from_physical(
+        scheduler_id: &str,
+        job_id: &JobId,
+        job_name: &str,
+        ctx: &SessionContext,
+        physical_plan: Arc<dyn ExecutionPlan>,
+        queued_at: u64,
+        rules: Option<&dyn AdaptiveRules>,
+    ) -> ballista_core::error::Result<Self> {
+        let planner = AdaptivePlanner::try_new_from_physical(
+            ctx,
+            physical_plan,
+            job_id.clone(),
+            rules,
+        )?;
+
+        Self::try_new_with_planner(
+            scheduler_id,
+            job_id,
+            job_name,
+            ctx,
+            planner,
+            None,
+            queued_at,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn try_new_with_planner(
+        scheduler_id: &str,
+        job_id: &JobId,
+        job_name: &str,
+        ctx: &SessionContext,
+        mut planner: AdaptivePlanner,
+        logical_plan: Option<String>,
+        queued_at: u64,
+    ) -> ballista_core::error::Result<Self> {
+        let session_id = ctx.session_id();
         let session_config = Arc::new(ctx.copied_config());
         let started_at = timestamp_millis();
 
@@ -190,8 +246,23 @@ impl AdaptiveExecutionGraph {
                 .collect();
         let stages = stages?;
 
+        let filter_config = session_config
+            .options()
+            .extensions
+            .get::<ballista_core::config::BallistaConfig>();
+        let runtime_filters = filter_config
+            .filter(|config| config.runtime_filter_enabled())
+            .map(|_| {
+                let mut registry = runtime_filter::RuntimeFilterRegistry::default();
+                for (&id, stage) in &stages {
+                    registry.register(id, stage.plan());
+                }
+                registry
+            });
+
         Ok(Self {
             planner,
+            runtime_filters,
             scheduler_id: Some(scheduler_id.to_string()),
             job_id: job_id.to_owned(),
             job_name: job_name.to_owned(),
@@ -460,8 +531,13 @@ impl AdaptiveExecutionGraph {
             self.resolve_prefix_merge_state(stage_id)?;
             let partitions = self.planner.take_stage_output_partitions(stage_id)?;
 
-            // Range-repartition stages need overlap-based remap of their partitions
             let maybe_stage = self.stages.get(&stage_id);
+            let column_statistics = match maybe_stage {
+                Some(ExecutionStage::Running(stage)) => stage.output_column_stats(),
+                _ => Vec::new(),
+            };
+
+            // Range-repartition stages need overlap-based remap of their partitions
             let partitions = if let Some(ExecutionStage::Running(stage)) = maybe_stage
                 && let Some(routing_expr) = repartition_routing_expr(stage.plan.as_ref())?
                 && let Some(routing) = Self::repartition_routing(stage, routing_expr)?
@@ -499,8 +575,11 @@ impl AdaptiveExecutionGraph {
             } else {
                 partitions
             };
-            self.planner
-                .resolve_stage_partitions(stage_id, partitions.clone())?;
+            self.planner.resolve_stage_partitions(
+                stage_id,
+                partitions.clone(),
+                column_statistics,
+            )?;
 
             let (runnable, stages_to_cancel) = self.planner.actionable_stages()?;
 
@@ -516,6 +595,9 @@ impl AdaptiveExecutionGraph {
                             self.session_config.clone(),
                             stage,
                         )?;
+                        if let Some(registry) = &mut self.runtime_filters {
+                            registry.register(stage_id, stage.plan());
+                        }
                         self.stages.insert(stage_id, stage);
                     }
                 }
@@ -595,6 +677,24 @@ impl AdaptiveExecutionGraph {
                 None
             }
         });
+
+        if let (Some(id), Some(registry)) = (running_stage_id, &mut self.runtime_filters)
+        {
+            let plan = self.stages[&id].plan_arc();
+            let prepared = match registry.prepare(id, plan.clone(), &self.stages) {
+                Ok(plan) => plan,
+                Err(error) => {
+                    log::warn!(
+                        "Runtime filter unavailable for stage {id}; bypassing: {error}"
+                    );
+                    plan
+                }
+            };
+            let ExecutionStage::Running(stage) = self.stages.get_mut(&id).unwrap() else {
+                unreachable!()
+            };
+            stage.plan = prepared;
+        }
 
         // If no available tasks found in the running stage,
         // try to find a resolved stage and convert it to the running stage
@@ -850,6 +950,8 @@ impl ExecutionGraph for AdaptiveExecutionGraph {
         max_stage_failures: usize,
     ) -> ballista_core::error::Result<Vec<QueryStageSchedulerEvent>> {
         let job_id = self.job_id().to_owned();
+        // The locations this update reports share one copy of the address.
+        let endpoint = Arc::new(ExecutorEndpoint::from(executor));
 
         // First of all, classify the statuses by stages
         let mut job_task_statuses: HashMap<usize, Vec<TaskStatus>> = HashMap::new();
@@ -1048,9 +1150,17 @@ impl ExecutionGraph for AdaptiveExecutionGraph {
                             successful_task,
                         )) = status
                         {
-                            // update task metrics for successful task
-                            running_stage
-                                .update_task_metrics(task_id, operator_metrics)?;
+                            // Metrics only feed the plan display and the REST
+                            // API. A task whose metrics can't be merged still
+                            // succeeded, and failing here would drop its status
+                            // and leave the stage, and the job, unfinished.
+                            if let Err(e) = running_stage
+                                .update_task_metrics(task_id, operator_metrics)
+                            {
+                                warn!(
+                                    "Ignoring the metrics of task {task_id} in stage {stage_id} of job {job_id}: {e}"
+                                );
+                            }
 
                             let ballista_core::serde::protobuf::SuccessfulTask {
                                 partitions,
@@ -1072,7 +1182,7 @@ impl ExecutionGraph for AdaptiveExecutionGraph {
 
                             locations.append(
                                 &mut crate::state::execution_graph::partition_to_location(
-                                    &job_id, task_id, stage_id, executor, partitions,
+                                    &job_id, task_id, stage_id, &endpoint, partitions,
                                 ),
                             );
                         } else {
@@ -1318,6 +1428,28 @@ impl ExecutionGraph for AdaptiveExecutionGraph {
         self.output_locations.clone()
     }
 
+    /// The default implementation treats a stage with no `output_links` as
+    /// final. Adaptive stages are created without output links, so it would
+    /// report every stage as final and no intermediate shuffle data would be
+    /// reclaimed when the job succeeds. Here a stage is final when the job's
+    /// `output_locations` point at it. Until those are set, nothing is
+    /// reported, so a final stage is never returned.
+    fn intermediate_stage_ids(&self) -> Vec<u32> {
+        if self.output_locations.is_empty() {
+            return vec![];
+        }
+        let final_stage_ids: HashSet<usize> = self
+            .output_locations
+            .iter()
+            .map(|location| location.partition_id.stage_id)
+            .collect();
+        self.stages
+            .keys()
+            .filter(|stage_id| !final_stage_ids.contains(stage_id))
+            .map(|stage_id| *stage_id as u32)
+            .collect()
+    }
+
     /// Reset running and successful stages on a given executor
     /// This will first check the unresolved/resolved/running stages and reset the running tasks and successful tasks.
     /// Then it will check the successful stage and whether there are running parent stages need to read shuffle from it.
@@ -1542,13 +1674,8 @@ impl ExecutionGraph for AdaptiveExecutionGraph {
         let job_id = self.job_id.clone();
         let session_id = self.session_id.clone();
 
-        let mut next_task = self.stages.iter_mut().find(|(_stage_id, stage)| {
-            if let ExecutionStage::Running(stage) = stage {
-                stage.available_tasks() > 0
-            } else {
-                false
-            }
-        }).map(|(stage_id, stage)| {
+        let ready_id = self.get_running_stage_id(&[]);
+        let mut next_task = ready_id.and_then(|id| self.stages.get_mut(&id).map(|stage| (id, stage))).map(|(stage_id, stage)| {
             if let ExecutionStage::Running(stage) = stage {
                 use ballista_core::serde::scheduler::TaskKey;
 
@@ -1587,7 +1714,7 @@ impl ExecutionGraph for AdaptiveExecutionGraph {
 
                 let key = TaskKey {
                     job_id,
-                    stage_id: *stage_id,
+                    stage_id,
                     task_id,
                 };
 
