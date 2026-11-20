@@ -36,7 +36,10 @@ use crate::execution_plans::{
 use crate::extension::SessionConfigExt;
 use crate::utils;
 
-use crate::serde::protobuf::ShuffleWritePartition;
+use crate::hll::HyperLogLog;
+use crate::serde::protobuf::{
+    ColumnSketch, ShuffleWritePartition, SketchType, TaskColumnStats,
+};
 use crate::serde::scheduler::PartitionStats;
 use datafusion::arrow::array::{
     ArrayBuilder, ArrayRef, StringBuilder, StructBuilder, UInt32Builder, UInt64Builder,
@@ -44,9 +47,11 @@ use datafusion::arrow::array::{
 use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 
 use datafusion::arrow::record_batch::RecordBatch;
+use datafusion::common::runtime::SpawnedTask;
 use datafusion::common::tree_node::TreeNodeRecursion;
 use datafusion::error::{DataFusionError, Result};
 use datafusion::physical_expr::PhysicalExpr;
+use datafusion::physical_expr::expressions::Column;
 use datafusion::physical_plan::memory::MemoryStream;
 use datafusion::physical_plan::metrics::{
     self, ExecutionPlanMetricsSet, MetricBuilder, MetricsSet,
@@ -55,16 +60,19 @@ use datafusion::physical_plan::metrics::{
 use datafusion::physical_plan::display::DisplayableExecutionPlan;
 use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PlanProperties,
-    SendableRecordBatchStream, Statistics, StatisticsArgs, statistics::ChildStats,
+    RecordBatchStream, SendableRecordBatchStream, Statistics, StatisticsArgs,
+    statistics::ChildStats,
 };
-use futures::TryStreamExt;
+use futures::{Stream, StreamExt, TryStreamExt};
+use std::pin::Pin;
+use std::task::{Context, Poll};
 
 use datafusion::execution::context::TaskContext;
 use datafusion::physical_plan::repartition::RepartitionExec;
 use datafusion::physical_plan::sorts::sort_preserving_merge::SortPreservingMergeExec;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use log::debug;
-use std::sync::Mutex;
+use std::sync::{Mutex, Weak};
 use tokio::sync::oneshot;
 use tokio::task::JoinSet;
 
@@ -174,8 +182,9 @@ pub(crate) fn walk_child_partition_mapping(
 ///
 /// Two cases:
 ///
-/// - `SortShuffleWriter(Hash(K))` — KSpace by construction; the K-space
-///   `[0..K-1]` is intrinsic. Input ids are irrelevant.
+/// - `SortShuffleWriter` — KSpace by construction, however it routes rows (by
+///   hash, range or partition id); the K-space `[0..K-1]` is intrinsic. Input
+///   ids are irrelevant.
 /// - `ShuffleWriter` — always passthrough; the child's plan shape decides:
 ///   - `SortPreservingMergeExec` in the child chain → `[0]` (collapse).
 ///   - `RepartitionExec(Hash|RoundRobin)` in the child chain → `[0..K-1]`.
@@ -189,10 +198,7 @@ pub fn compute_global_output_partition_ids(
     global_input_partition_ids: &[usize],
 ) -> Vec<usize> {
     if let Some(w) = stage_plan.downcast_ref::<SortShuffleWriterExec>() {
-        let Partitioning::Hash(_, k) = w.shuffle_output_partitioning() else {
-            unreachable!("SortShuffleWriterExec is Hash-partitioned by construction");
-        };
-        return (0..*k).collect();
+        return (0..w.routing().partition_count()).collect();
     }
     if let Some(w) = stage_plan.downcast_ref::<PipelinedShuffleWriterExec>()
         && let Some(Partitioning::Hash(_, k)) = w.shuffle_output_partitioning()
@@ -227,7 +233,7 @@ pub const DEFAULT_SHUFFLE_CHANNEL_CAPACITY: usize = 8;
 /// Shared state for the coordinator+handoff pattern (see range_repartition.rs
 /// upstream for the reference design). The first `execute(N)` call spawns a
 /// single coordinator task that owns all K writes; every `execute(N)` call
-/// takes its own `oneshot::Receiver` and awaits the summaries for partition N.
+/// takes its own [`Handoff`] and awaits the summaries for partition N.
 ///
 /// The receiver payload is a `Vec` so writers that produce multiple files per
 /// output partition (e.g. `SortShuffleWriterExec` under a multi-partition
@@ -235,18 +241,293 @@ pub const DEFAULT_SHUFFLE_CHANNEL_CAPACITY: usize = 8;
 /// partitions) can hand the full set to a single `execute(N)` stream.
 /// Passthrough / hash-repart writers produce at most one summary per slot.
 pub(crate) struct WriterState {
-    pub(crate) initialized: bool,
+    /// The coordinator spawned by the first `execute(N)` call, or `None`
+    /// before that call. The state holds it weakly, so only the handoffs
+    /// keep it running (see [`Handoff`]).
+    coordinator: Option<Weak<SpawnedTask<()>>>,
     /// One receiver per output partition. `execute(N)` takes `handoffs[N]`;
     /// the coordinator holds the matching sender and pushes the summaries
     /// once partition N's files are closed.
-    pub(crate) handoffs:
-        Vec<Option<oneshot::Receiver<Result<Vec<ShuffleWritePartition>>>>>,
+    handoffs: Vec<Option<oneshot::Receiver<Result<Vec<ShuffleWritePartition>>>>>,
+}
+
+impl WriterState {
+    /// Creates the state of a writer with `output_partition_count` output
+    /// partitions, before its first `execute(N)` call.
+    pub(crate) fn new(output_partition_count: usize) -> Self {
+        Self {
+            coordinator: None,
+            handoffs: (0..output_partition_count).map(|_| None).collect(),
+        }
+    }
+
+    /// Takes the handoff for `partition`, spawning the coordinator on the
+    /// first call.
+    ///
+    /// The first call creates one oneshot per output partition and passes the
+    /// senders to `spawn_coordinator`, which spawns the coordinator and returns
+    /// its task. Fails when `partition` is out of range or the handoff of
+    /// `partition` was already taken. The range check runs before the
+    /// coordinator is spawned. `name`, the calling exec's name, starts the
+    /// error message.
+    pub(crate) fn take_handoff(
+        &mut self,
+        name: &str,
+        partition: usize,
+        spawn_coordinator: impl FnOnce(
+            Vec<oneshot::Sender<Result<Vec<ShuffleWritePartition>>>>,
+        ) -> SpawnedTask<()>,
+    ) -> Result<Handoff> {
+        let k = self.handoffs.len();
+        let taken_or_out_of_range = || {
+            DataFusionError::Internal(format!(
+                "{name}: execute({partition}) called twice or out of range (have {k} partitions)"
+            ))
+        };
+        if partition >= k {
+            return Err(taken_or_out_of_range());
+        }
+
+        let coordinator = match &self.coordinator {
+            Some(coordinator) => coordinator.upgrade(),
+            None => {
+                let mut senders = Vec::with_capacity(k);
+                for slot in &mut self.handoffs {
+                    let (tx, rx) = oneshot::channel();
+                    senders.push(tx);
+                    *slot = Some(rx);
+                }
+                let coordinator = Arc::new(spawn_coordinator(senders));
+                self.coordinator = Some(Arc::downgrade(&coordinator));
+                Some(coordinator)
+            }
+        };
+
+        let summaries = self.handoffs[partition]
+            .take()
+            .ok_or_else(taken_or_out_of_range)?;
+        Ok(Handoff {
+            summaries,
+            _coordinator: coordinator,
+        })
+    }
+}
+
+/// The receiver for one output partition's summaries, together with a share
+/// of the coordinator task that sends them.
+///
+/// The coordinator runs while any handoff, or any stream built from one by
+/// [`handoff_stream`], is alive. Dropping the last one aborts the
+/// coordinator and the write tasks it owns, so a cancelled task stops reading
+/// its input once it drops its `execute(N)` streams.
+///
+/// [`WriterState`] holds the coordinator weakly. A strong reference there
+/// would keep the coordinator running after a cancel. Both the plan, which
+/// the executor keeps to collect metrics, and the coordinator's own copy of
+/// the writer hold the state.
+pub(crate) struct Handoff {
+    summaries: oneshot::Receiver<Result<Vec<ShuffleWritePartition>>>,
+    /// `None` when the coordinator had already stopped before this handoff
+    /// was taken. `summaries` then holds what it sent, or reports it gone.
+    _coordinator: Option<Arc<SpawnedTask<()>>>,
+}
+
+impl Handoff {
+    /// Waits for the summaries. The coordinator keeps running at least until
+    /// this future completes or is dropped.
+    async fn recv(self, name: &str) -> Result<Vec<ShuffleWritePartition>> {
+        self.summaries.await.map_err(|_| {
+            DataFusionError::Internal(format!(
+                "{name} coordinator dropped without sending"
+            ))
+        })?
+    }
+}
+
+/// Per-column statistics over everything a writer wrote: a logical null count
+/// for every column, plus a HyperLogLog distinct-count sketch for the columns
+/// chosen by [`sketched_columns`]. Clones share the totals, so the executor can
+/// read them from its copy of the writer once the task has finished.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct ColumnStatsCollector(Arc<Mutex<ColumnStatsTotals>>);
+
+#[derive(Debug, Default)]
+struct ColumnStatsTotals {
+    null_counts: Vec<u64>,
+    /// `(column index, sketch)` for each sketched column.
+    sketches: Vec<(usize, HyperLogLog)>,
+}
+
+/// The columns a writer sketches: the plain column references among the hash
+/// partitioning expressions, which are the join and grouping keys downstream
+/// of the shuffle. Nothing is sketched for other partitionings or when
+/// `enabled` is false.
+pub(crate) fn sketched_columns(partitioning: &Partitioning, enabled: bool) -> Vec<usize> {
+    let Partitioning::Hash(exprs, _) = partitioning else {
+        return vec![];
+    };
+    if !enabled {
+        return vec![];
+    }
+    let mut columns: Vec<usize> = exprs
+        .iter()
+        .filter_map(|expr| expr.downcast_ref::<Column>().map(Column::index))
+        .collect();
+    columns.sort_unstable();
+    columns.dedup();
+    columns
+}
+
+impl ColumnStatsCollector {
+    /// Clears the totals and sizes them for `num_columns` columns, sketching
+    /// the ones in `sketched` at `precision`.
+    pub(crate) fn reset(&self, num_columns: usize, sketched: &[usize], precision: u8) {
+        if let Ok(mut totals) = self.0.lock() {
+            *totals = ColumnStatsTotals {
+                null_counts: vec![0; num_columns],
+                sketches: sketched
+                    .iter()
+                    .map(|&column| (column, HyperLogLog::new(precision)))
+                    .collect(),
+            };
+        }
+    }
+
+    /// Wraps `stream` so every batch it yields is added to these totals. Each
+    /// stream counts on its own and adds its totals when dropped, so the
+    /// partitions a task drains concurrently don't share a lock per batch.
+    ///
+    /// `ignored_column` is a column of `stream` that the writer routes on but
+    /// does not write. It is left out, so the totals have one entry per
+    /// written column. It must not be a sketched column.
+    pub(crate) fn count(
+        &self,
+        stream: SendableRecordBatchStream,
+        ignored_column: Option<usize>,
+    ) -> SendableRecordBatchStream {
+        let num_columns =
+            stream.schema().fields().len() - usize::from(ignored_column.is_some());
+        let sketches = self
+            .0
+            .lock()
+            .map(|totals| {
+                totals
+                    .sketches
+                    .iter()
+                    .map(|(column, total)| (*column, HyperLogLog::new(total.precision())))
+                    .collect()
+            })
+            .unwrap_or_default();
+        Box::pin(ColumnStatsStream {
+            input: stream,
+            null_counts: vec![0; num_columns],
+            ignored_column,
+            sketches,
+            hashes: Vec::new(),
+            total: self.clone(),
+        })
+    }
+
+    /// The null counts, one per column of the written schema.
+    pub(crate) fn null_counts(&self) -> Vec<u64> {
+        self.0
+            .lock()
+            .map(|totals| totals.null_counts.clone())
+            .unwrap_or_default()
+    }
+
+    /// The totals in the form the executor reports to the scheduler: one
+    /// entry per column, with an HLL sketch on each sketched column.
+    pub(crate) fn task_column_stats(&self) -> Vec<TaskColumnStats> {
+        let Ok(totals) = self.0.lock() else {
+            return vec![];
+        };
+        let mut stats: Vec<TaskColumnStats> = totals
+            .null_counts
+            .iter()
+            .enumerate()
+            .map(|(column, &null_count)| TaskColumnStats {
+                column: column as u32,
+                null_count,
+                sketches: vec![],
+            })
+            .collect();
+        for (column, sketch) in &totals.sketches {
+            if let Some(entry) = stats.get_mut(*column) {
+                entry.sketches.push(ColumnSketch {
+                    r#type: SketchType::Hll as i32,
+                    data: sketch.as_bytes().to_vec(),
+                });
+            }
+        }
+        stats
+    }
+}
+
+/// See [`ColumnStatsCollector::count`].
+struct ColumnStatsStream {
+    input: SendableRecordBatchStream,
+    null_counts: Vec<u64>,
+    /// A column of `input` that isn't counted, see [`ColumnStatsCollector::count`].
+    ignored_column: Option<usize>,
+    sketches: Vec<(usize, HyperLogLog)>,
+    /// Scratch space for hashing a column.
+    hashes: Vec<u64>,
+    total: ColumnStatsCollector,
+}
+
+impl Stream for ColumnStatsStream {
+    type Item = Result<RecordBatch>;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let this = self.get_mut();
+        let poll = this.input.poll_next_unpin(cx);
+        if let Poll::Ready(Some(Ok(batch))) = &poll {
+            let counted = batch
+                .columns()
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| Some(*i) != this.ignored_column)
+                .map(|(_, column)| column);
+            for (slot, column) in this.null_counts.iter_mut().zip(counted) {
+                *slot += column.logical_null_count() as u64;
+            }
+            for (column, sketch) in this.sketches.iter_mut() {
+                if let Err(e) = sketch.update(batch.column(*column), &mut this.hashes) {
+                    return Poll::Ready(Some(Err(e)));
+                }
+            }
+        }
+        poll
+    }
+}
+
+impl RecordBatchStream for ColumnStatsStream {
+    fn schema(&self) -> SchemaRef {
+        self.input.schema()
+    }
+}
+
+impl Drop for ColumnStatsStream {
+    fn drop(&mut self) {
+        if let Ok(mut total) = self.total.0.lock() {
+            for (slot, n) in total.null_counts.iter_mut().zip(&self.null_counts) {
+                *slot += n;
+            }
+            for ((_, slot), (_, sketch)) in total.sketches.iter_mut().zip(&self.sketches)
+            {
+                // Both were made at the precision `reset` chose, so they merge.
+                let merged = slot.merge(sketch);
+                debug_assert!(merged, "stream sketch and total differ in precision");
+            }
+        }
+    }
 }
 
 impl Debug for WriterState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("WriterState")
-            .field("initialized", &self.initialized)
+            .field("coordinator", &self.coordinator)
             .field("handoffs", &self.handoffs.len())
             .finish()
     }
@@ -376,6 +657,8 @@ pub struct ShuffleWriterExec {
     /// clone of the writer produced by `with_new_children` participates in
     /// the same coordinator.
     state: Arc<Mutex<WriterState>>,
+    /// Statistics of the rows this task wrote, shared with clones.
+    column_stats: ColumnStatsCollector,
 }
 
 impl Clone for ShuffleWriterExec {
@@ -390,6 +673,7 @@ impl Clone for ShuffleWriterExec {
             metrics: self.metrics.clone(),
             properties: self.properties.clone(),
             state: self.state.clone(),
+            column_stats: self.column_stats.clone(),
         }
     }
 }
@@ -475,10 +759,8 @@ impl ShuffleWriterExec {
             global_output_partition_ids: default_partition_slice,
             metrics: ExecutionPlanMetricsSet::new(),
             properties,
-            state: Arc::new(Mutex::new(WriterState {
-                initialized: false,
-                handoffs: (0..output_partition_count).map(|_| None).collect(),
-            })),
+            state: Arc::new(Mutex::new(WriterState::new(output_partition_count))),
+            column_stats: ColumnStatsCollector::default(),
         })
     }
 
@@ -514,6 +796,19 @@ impl ShuffleWriterExec {
     /// Global partition slice this writer instance is bound to.
     pub fn global_output_partition_ids(&self) -> &[usize] {
         &self.global_output_partition_ids
+    }
+
+    /// Per-column null counts over all rows this task wrote, one per column
+    /// of the output schema. Empty until the task has written.
+    pub fn column_null_counts(&self) -> Vec<u64> {
+        self.column_stats.null_counts()
+    }
+
+    /// Per-column statistics over all rows this task wrote, as reported to
+    /// the scheduler: a null count for every column and an HLL sketch for
+    /// each hash-partitioning key column. Empty until the task has written.
+    pub fn column_stats(&self) -> Vec<TaskColumnStats> {
+        self.column_stats.task_column_stats()
     }
 
     /// Drain every window-state collector in this stage, translating each
@@ -568,12 +863,21 @@ impl ShuffleWriterExec {
         let partition_map =
             walk_child_partition_mapping(&plan, &self.global_output_partition_ids);
         let metrics = self.metrics.clone();
+        let column_stats = self.column_stats.clone();
 
         async move {
             let now = Instant::now();
             let config = context.session_config().ballista_config();
             let compression_type = config.shuffle_compression_codec()?;
             let channel_capacity = config.shuffle_writer_channel_capacity();
+            column_stats.reset(
+                plan.schema().fields().len(),
+                &sketched_columns(
+                    plan.properties().output_partitioning(),
+                    config.shuffle_collect_distinct_counts(),
+                ),
+                config.shuffle_collect_distinct_counts_precision(),
+            );
 
             // Passthrough shuffle: drain each of the child's output
             // partitions into its own file. All K must drain
@@ -608,7 +912,8 @@ impl ShuffleWriterExec {
 
                 debug!("Writing results to {path:?}");
 
-                let mut stream = plan.execute(local_input_partition, context.clone())?;
+                let mut stream = column_stats
+                    .count(plan.execute(local_input_partition, context.clone())?, None);
                 handles.spawn(async move {
                     let stats = utils::write_stream_to_disk(
                         &mut stream,
@@ -744,7 +1049,9 @@ impl ExecutionPlan for ShuffleWriterExec {
     /// channels, and spawns a single coordinator task that drives the
     /// write work for all K output partitions and sends each summary to
     /// its matching partition's oneshot sender. Subsequent calls take
-    /// their receiver and return a stream that awaits it.
+    /// their receiver and return a stream that awaits it. If every stream
+    /// returned so far is dropped before its summaries arrive, the
+    /// coordinator stops, and the streams of later calls fail.
     ///
     /// Caller (typically `DefaultQueryStageExec::execute_query_stage`)
     /// should spawn all K `execute(N, ctx)` calls concurrently so the
@@ -754,27 +1061,24 @@ impl ExecutionPlan for ShuffleWriterExec {
         partition: usize,
         context: Arc<TaskContext>,
     ) -> Result<SendableRecordBatchStream> {
-        let mut guard = self.state.lock().map_err(|_| {
-            DataFusionError::Internal("ShuffleWriterExec state mutex poisoned".to_owned())
-        })?;
-        let state = &mut *guard;
-        let rx = take_handoff(
-            "ShuffleWriterExec",
-            &mut state.initialized,
-            &mut state.handoffs,
-            partition,
-            |senders| {
+        let handoff = self
+            .state
+            .lock()
+            .map_err(|_| {
+                DataFusionError::Internal(
+                    "ShuffleWriterExec state mutex poisoned".to_owned(),
+                )
+            })?
+            .take_handoff("ShuffleWriterExec", partition, |senders| {
                 let writer = self.clone();
-                tokio::spawn(async move {
+                SpawnedTask::spawn(async move {
                     run_coordinator(writer.execute_shuffle_write(context), senders).await;
-                });
-            },
-        )?;
-        drop(guard);
+                })
+            })?;
 
         Ok(handoff_stream(
             "ShuffleWriterExec",
-            rx,
+            handoff,
             self.work_dir.clone(),
             self.job_id.clone(),
             self.stage_id,
@@ -893,45 +1197,12 @@ pub(crate) async fn run_coordinator<F>(
     }
 }
 
-/// Takes the handoff receiver for `partition`. The first call creates one
-/// oneshot per output partition and passes the senders to
-/// `spawn_coordinator`. `name` is the calling exec, used in the error for a
-/// repeated or out-of-range partition.
-pub(crate) fn take_handoff(
-    name: &str,
-    initialized: &mut bool,
-    handoffs: &mut [Option<oneshot::Receiver<Result<Vec<ShuffleWritePartition>>>>],
-    partition: usize,
-    spawn_coordinator: impl FnOnce(Vec<oneshot::Sender<Result<Vec<ShuffleWritePartition>>>>),
-) -> Result<oneshot::Receiver<Result<Vec<ShuffleWritePartition>>>> {
-    if !*initialized {
-        *initialized = true;
-        let mut senders: Vec<oneshot::Sender<Result<Vec<ShuffleWritePartition>>>> =
-            Vec::with_capacity(handoffs.len());
-        for slot in handoffs.iter_mut() {
-            let (tx, rx) = oneshot::channel();
-            senders.push(tx);
-            *slot = Some(rx);
-        }
-        spawn_coordinator(senders);
-    }
-
-    let k = handoffs.len();
-    handoffs
-        .get_mut(partition)
-        .and_then(Option::take)
-        .ok_or_else(|| {
-            DataFusionError::Internal(format!(
-                "{name}: execute({partition}) called twice or out of range (have {k} partitions)"
-            ))
-        })
-}
-
-/// Wraps a receiver from [`take_handoff`] in the metadata stream returned by
-/// `execute(N)`.
+/// Wraps a handoff from [`WriterState::take_handoff`] in the metadata stream
+/// returned by `execute(N)`. The stream keeps the coordinator running until
+/// the summaries arrive or the stream is dropped.
 pub(crate) fn handoff_stream(
     name: &'static str,
-    rx: oneshot::Receiver<Result<Vec<ShuffleWritePartition>>>,
+    handoff: Handoff,
     work_dir: String,
     job_id: JobId,
     stage_id: usize,
@@ -942,11 +1213,7 @@ pub(crate) fn handoff_stream(
     Box::pin(RecordBatchStreamAdapter::new(
         schema,
         futures::stream::once(async move {
-            let summaries = rx.await.map_err(|_| {
-                DataFusionError::Internal(format!(
-                    "{name} coordinator dropped without sending"
-                ))
-            })??;
+            let summaries = handoff.recv(name).await?;
             summaries_to_batch(summaries, schema_captured, &work_dir, &job_id, stage_id)
         })
         .try_flatten(),
@@ -1078,16 +1345,22 @@ mod tests {
     use super::*;
     use crate::error::BallistaError;
     use crate::execution_plans::ChaosExec;
+    use crate::execution_plans::sort_shuffle::SortShuffleConfig;
+    use crate::execution_plans::test_util::{drive_partition_results, two_by_two_input};
+    use crate::execution_plans::{RangeShuffleWriterExec, SortShuffleWriterExec};
     use datafusion::arrow::array::{
         AsArray, StringArray, StringViewArray, StructArray, UInt32Array, UInt64Array,
     };
     use datafusion::arrow::ipc::reader::StreamReader;
     use datafusion::datasource::memory::MemorySourceConfig;
-    use datafusion::datasource::source::DataSourceExec;
+    use datafusion::physical_expr::{LexOrdering, PhysicalSortExpr};
     use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
     use datafusion::physical_plan::display::DefaultDisplay;
     use datafusion::physical_plan::expressions::Column;
+    use datafusion::physical_plan::sorts::sort::SortExec;
+    use datafusion::physical_plan::test::exec::BlockingExec;
     use datafusion::prelude::SessionContext;
+    use std::time::Duration;
     use tempfile::TempDir;
 
     /// Spawn K parallel `plan.execute(N, ctx)` calls, collect each stream's
@@ -1099,50 +1372,11 @@ mod tests {
         plan: Arc<ShuffleWriterExec>,
         task_ctx: Arc<TaskContext>,
     ) -> Result<Vec<RecordBatch>> {
-        let k = plan.properties().output_partitioning().partition_count();
-        let mut handles = Vec::with_capacity(k);
-        for n in 0..k {
-            let plan = plan.clone();
-            let ctx = task_ctx.clone();
-            handles.push(tokio::spawn(async move {
-                let mut stream = plan.execute(n, ctx)?;
-                utils::collect_stream(&mut stream)
-                    .await
-                    .map_err(|e| DataFusionError::Execution(format!("{e:?}")))
-            }));
-        }
         let mut all = Vec::new();
-        for h in handles {
-            let batches = h.await.map_err(|e| {
-                DataFusionError::Execution(format!("drive_all_partitions panic: {e}"))
-            })??;
-            all.extend(batches);
+        for result in drive_partition_results(plan, task_ctx).await {
+            all.extend(result.map_err(|e| DataFusionError::Execution(format!("{e:?}")))?);
         }
         Ok(all)
-    }
-
-    async fn drive_partition_results(
-        plan: Arc<ShuffleWriterExec>,
-        task_ctx: Arc<TaskContext>,
-    ) -> Vec<crate::error::Result<Vec<RecordBatch>>> {
-        let k = plan.properties().output_partitioning().partition_count();
-        let mut handles = Vec::with_capacity(k);
-        for n in 0..k {
-            let plan = plan.clone();
-            let ctx = task_ctx.clone();
-            handles.push(tokio::spawn(async move {
-                let mut stream = plan.execute(n, ctx).map_err(BallistaError::from)?;
-                utils::collect_stream(&mut stream).await
-            }));
-        }
-        let mut results = Vec::new();
-        for h in handles {
-            results.push(
-                h.await
-                    .expect("drive_partition_results task should not panic"),
-            );
-        }
-        results
     }
 
     fn assert_shared_structural_error(err: &BallistaError) {
@@ -1169,7 +1403,7 @@ mod tests {
 
         // No output partitioning: passthrough writer, one file per one of
         // the input plan's 2 partitions.
-        let input_plan = create_input_plan()?;
+        let input_plan = two_by_two_input()?;
         let work_dir = TempDir::new()?;
         let query_stage = Arc::new(ShuffleWriterExec::try_new(
             JobId::new("jobOne"),
@@ -1223,7 +1457,7 @@ mod tests {
         let session_ctx = SessionContext::new();
         let task_ctx = session_ctx.task_ctx();
 
-        let input_plan = Arc::new(CoalescePartitionsExec::new(create_input_plan()?));
+        let input_plan = Arc::new(CoalescePartitionsExec::new(two_by_two_input()?));
         let work_dir = TempDir::new()?;
         let query_stage = ShuffleWriterExec::try_new(
             JobId::new("jobDisplay"),
@@ -1264,7 +1498,7 @@ mod tests {
         }
 
         // the passthrough case: the writer inherits its input's partitioning
-        let passthrough = render(create_input_plan()?)?;
+        let passthrough = render(two_by_two_input()?)?;
         assert!(
             passthrough.contains("UnknownPartitioning(2)"),
             "expected the input plan's 2 partitions:\n{passthrough}"
@@ -1272,7 +1506,7 @@ mod tests {
 
         // a hash-partitioned input has to come through as such, exprs and all
         let hashed = render(Arc::new(RepartitionExec::try_new(
-            create_input_plan()?,
+            two_by_two_input()?,
             Partitioning::Hash(vec![Arc::new(Column::new("a", 0))], 4),
         )?))?;
         assert!(
@@ -1303,11 +1537,8 @@ mod tests {
         // 2 rows backed by a data buffer that holds all 1000 strings
         let batch =
             RecordBatch::try_new(schema.clone(), vec![Arc::new(strings)])?.slice(10, 2);
-        let input = Arc::new(DataSourceExec::new(Arc::new(MemorySourceConfig::try_new(
-            &[vec![batch.clone()]],
-            schema,
-            None,
-        )?)));
+        let input =
+            MemorySourceConfig::try_new_exec(&[vec![batch.clone()]], schema, None)?;
         let work_dir = TempDir::new()?;
         let query_stage = Arc::new(ShuffleWriterExec::try_new(
             JobId::new("jobViews"),
@@ -1337,7 +1568,7 @@ mod tests {
         let task_ctx = session_ctx.task_ctx();
 
         let input_plan: Arc<dyn ExecutionPlan> = Arc::new(ChaosExec::new(
-            create_input_plan()?,
+            two_by_two_input()?,
             1.0,
             "transient",
             Some(42),
@@ -1367,7 +1598,7 @@ mod tests {
         let query_stage = Arc::new(ShuffleWriterExec::try_new(
             JobId::new("jobTwice"),
             1,
-            create_input_plan()?,
+            two_by_two_input()?,
             work_dir.path().to_str().unwrap().to_owned(),
         )?);
         drive_all_partitions(query_stage.clone(), task_ctx.clone()).await?;
@@ -1387,6 +1618,69 @@ mod tests {
         Ok(())
     }
 
+    /// An out-of-range first call must error before the coordinator is
+    /// spawned. Otherwise it would spawn the coordinator and drop its only
+    /// share, and every later valid call would fail.
+    #[tokio::test]
+    async fn later_calls_succeed_after_an_out_of_range_first_call() -> Result<()> {
+        let task_ctx = SessionContext::new().task_ctx();
+        let work_dir = TempDir::new()?;
+        let query_stage = Arc::new(ShuffleWriterExec::try_new(
+            JobId::new("jobOutOfRange"),
+            1,
+            two_by_two_input()?,
+            work_dir.path().to_str().unwrap().to_owned(),
+        )?);
+        let Err(_) = query_stage.execute(2, task_ctx.clone()) else {
+            panic!("execute(2) must error");
+        };
+
+        let batches = drive_all_partitions(query_stage, task_ctx).await?;
+        assert_eq!(2, batches.len());
+        Ok(())
+    }
+
+    /// The stream that spawned the coordinator may be dropped before the other
+    /// streams are taken. The coordinator sends every summary before it
+    /// finishes, so the later streams still receive theirs.
+    #[tokio::test]
+    async fn later_calls_succeed_after_the_first_stream_completed() -> Result<()> {
+        let task_ctx = SessionContext::new().task_ctx();
+        let work_dir = TempDir::new()?;
+        let query_stage = Arc::new(ShuffleWriterExec::try_new(
+            JobId::new("jobSequential"),
+            1,
+            two_by_two_input()?,
+            work_dir.path().to_str().unwrap().to_owned(),
+        )?);
+
+        let first = {
+            let mut stream = query_stage.execute(0, task_ctx.clone())?;
+            utils::collect_stream(&mut stream).await
+        }
+        .map_err(BallistaError::into_datafusion)?;
+        let coordinator = query_stage
+            .state
+            .lock()
+            .expect("the writer state is not poisoned")
+            .coordinator
+            .clone()
+            .expect("the first call spawned the coordinator");
+        assert_eq!(
+            0,
+            coordinator.strong_count(),
+            "the finished stream dropped its share"
+        );
+
+        let mut stream = query_stage.execute(1, task_ctx)?;
+        let second = utils::collect_stream(&mut stream)
+            .await
+            .map_err(BallistaError::into_datafusion)?;
+        assert_eq!(1, first.len());
+        assert_eq!(1, second.len());
+        Ok(())
+    }
+
     #[tokio::test]
     async fn test_create_dir_failure_propagates() -> Result<()> {
         let session_ctx = SessionContext::new();
@@ -1403,7 +1697,7 @@ mod tests {
         std::fs::File::create(&stage_id_as_file).unwrap();
         let work_dir = tmp.path().to_str().unwrap().to_owned();
 
-        let input_plan = Arc::new(CoalescePartitionsExec::new(create_input_plan()?));
+        let input_plan = Arc::new(CoalescePartitionsExec::new(two_by_two_input()?));
         let query_stage = Arc::new(ShuffleWriterExec::try_new(
             "jobOne".into(),
             1,
@@ -1418,26 +1712,259 @@ mod tests {
         Ok(())
     }
 
-    fn create_input_plan() -> Result<Arc<dyn ExecutionPlan>> {
+    // Only plain column references among hash keys are sketched, once each.
+    #[test]
+    fn sketched_columns_are_the_hash_key_columns() {
+        use datafusion::physical_expr::expressions::{BinaryExpr, lit};
+        let b: Arc<dyn PhysicalExpr> = Arc::new(Column::new("b", 1));
+        let a_plus_one: Arc<dyn PhysicalExpr> = Arc::new(BinaryExpr::new(
+            Arc::new(Column::new("a", 0)),
+            datafusion::logical_expr::Operator::Plus,
+            lit(1),
+        ));
+        let hash = Partitioning::Hash(vec![b.clone(), a_plus_one, b], 4);
+        assert_eq!(sketched_columns(&hash, true), vec![1]);
+        assert!(sketched_columns(&hash, false).is_empty());
+        assert!(sketched_columns(&Partitioning::RoundRobinBatch(4), true).is_empty());
+    }
+
+    // Null counts are summed over every partition the task drains, per column
+    // of the written schema.
+    #[tokio::test]
+    async fn column_null_counts_fold_across_partitions() -> Result<()> {
         let schema = Arc::new(Schema::new(vec![
             Field::new("a", DataType::UInt32, true),
             Field::new("b", DataType::Utf8, true),
         ]));
-
-        // define data.
         let batch = RecordBatch::try_new(
             schema.clone(),
             vec![
-                Arc::new(UInt32Array::from(vec![Some(1), Some(3)])),
-                Arc::new(StringArray::from(vec![Some("hello"), Some("world")])),
+                Arc::new(UInt32Array::from(vec![None, Some(3), None])),
+                Arc::new(StringArray::from(vec![Some("x"), Some("y"), None])),
             ],
         )?;
-        let partition = vec![batch.clone(), batch];
-        let partitions = vec![partition.clone(), partition];
+        let partitions = vec![vec![batch.clone(), batch.clone()], vec![batch]];
+        let input = MemorySourceConfig::try_new_exec(&partitions, schema, None)?;
 
-        let memory_data_source =
-            Arc::new(MemorySourceConfig::try_new(&partitions, schema, None)?);
+        let work_dir = TempDir::new()?;
+        let writer = Arc::new(ShuffleWriterExec::try_new(
+            JobId::new("jobOne"),
+            1,
+            input,
+            work_dir.path().to_str().unwrap().to_owned(),
+        )?);
+        assert!(writer.column_null_counts().is_empty());
 
-        Ok(Arc::new(DataSourceExec::new(memory_data_source)))
+        drive_all_partitions(writer.clone(), SessionContext::new().task_ctx()).await?;
+
+        assert_eq!(writer.column_null_counts(), vec![6, 3]);
+        Ok(())
+    }
+
+    /// Drive a passthrough writer over a hash repartition of column "a"
+    /// (100 distinct values over 1000 rows, 4 partitions) and return the
+    /// column stats it reports.
+    async fn child_hash_key_column_stats(
+        task_ctx: Arc<TaskContext>,
+    ) -> Result<Vec<TaskColumnStats>> {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("a", DataType::UInt32, false),
+            Field::new("b", DataType::UInt32, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(UInt32Array::from_iter_values((0..1000).map(|i| i % 100))),
+                Arc::new(UInt32Array::from_iter_values(0..1000)),
+            ],
+        )?;
+        let source = MemorySourceConfig::try_new_exec(&[vec![batch]], schema, None)?;
+        let input = Arc::new(RepartitionExec::try_new(
+            source,
+            Partitioning::Hash(vec![Arc::new(Column::new("a", 0))], 4),
+        )?);
+
+        let work_dir = TempDir::new()?;
+        let writer = Arc::new(ShuffleWriterExec::try_new(
+            JobId::new("jobOne"),
+            1,
+            input,
+            work_dir.path().to_str().unwrap().to_owned(),
+        )?);
+        drive_all_partitions(writer.clone(), task_ctx).await?;
+        Ok(writer.column_stats())
+    }
+
+    // A passthrough writer over a hash repartition sketches the hash key, and
+    // the sketch counts distinct values across every partition it drained.
+    #[tokio::test]
+    async fn column_stats_sketch_the_child_hash_key() -> Result<()> {
+        let stats = child_hash_key_column_stats(SessionContext::new().task_ctx()).await?;
+        assert_eq!(stats.len(), 2);
+        let [sketch] = stats[0].sketches.as_slice() else {
+            panic!("expected one sketch on the hash key, got {:?}", stats[0]);
+        };
+        assert_eq!(sketch.data.len(), 1 << crate::hll::DEFAULT_PRECISION);
+        let distinct = crate::hll::HyperLogLog::from_bytes(&sketch.data)
+            .unwrap()
+            .count();
+        assert!((95..=105).contains(&distinct), "estimated {distinct}");
+        assert!(stats[1].sketches.is_empty());
+        Ok(())
+    }
+
+    // The sketch is made at the precision the session asks for.
+    #[tokio::test]
+    async fn column_stats_sketch_at_the_configured_precision() -> Result<()> {
+        use crate::extension::SessionConfigExt;
+        use datafusion::prelude::SessionConfig;
+
+        let config = SessionConfig::new_with_ballista().set_usize(
+            crate::config::BALLISTA_SHUFFLE_COLLECT_DISTINCT_COUNTS_PRECISION,
+            10,
+        );
+        let task_ctx = SessionContext::new_with_config(config).task_ctx();
+        let stats = child_hash_key_column_stats(task_ctx).await?;
+        let [sketch] = stats[0].sketches.as_slice() else {
+            panic!("expected one sketch on the hash key, got {:?}", stats[0]);
+        };
+        assert_eq!(sketch.data.len(), 1 << 10);
+        let distinct = crate::hll::HyperLogLog::from_bytes(&sketch.data)
+            .unwrap()
+            .count();
+        // Standard error is 3.3% here.
+        assert!((80..=120).contains(&distinct), "estimated {distinct}");
+        Ok(())
+    }
+
+    #[test]
+    fn range_sort_shuffle_output_ids_do_not_follow_the_input_slice() -> Result<()> {
+        use crate::execution_plans::sort_shuffle::SortShuffleConfig;
+        use datafusion::common::ScalarValue;
+        use datafusion::physical_expr::{
+            LexOrdering, PhysicalSortExpr, RangePartitioning, SplitPoint,
+        };
+
+        let split = |v| SplitPoint::new(vec![ScalarValue::UInt32(Some(v))]);
+        let ordering = LexOrdering::new(vec![PhysicalSortExpr::new_default(Arc::new(
+            Column::new("a", 0),
+        ))])
+        .unwrap();
+        let range = RangePartitioning::try_new(ordering, vec![split(10), split(20)])?;
+        let writer: Arc<dyn ExecutionPlan> = Arc::new(SortShuffleWriterExec::try_new(
+            "job".into(),
+            1,
+            two_by_two_input()?,
+            String::new(),
+            Partitioning::Range(range),
+            SortShuffleConfig::default(),
+        )?);
+
+        assert_eq!(
+            compute_global_output_partition_ids(&writer, &[5, 6]),
+            vec![0, 1, 2]
+        );
+        Ok(())
+    }
+
+    /// A cancelled task dropped its `execute(N)` streams, but the coordinator
+    /// kept draining the input until the input ended.
+    #[tokio::test]
+    async fn dropping_every_output_stream_stops_the_write() -> Result<()> {
+        let (input, input_refs) = blocking_input();
+        let work_dir = TempDir::new()?;
+        let writer = ShuffleWriterExec::try_new(
+            JobId::new("jobOne"),
+            1,
+            input,
+            work_dir.path().to_str().unwrap().to_owned(),
+        )?;
+        assert_dropping_output_streams_stops_input(&writer, &input_refs).await
+    }
+
+    /// The sort writer runs its own coordinator, which also kept draining the
+    /// input after its `execute(N)` streams were dropped.
+    #[tokio::test]
+    async fn dropping_every_sort_shuffle_output_stream_stops_the_write() -> Result<()> {
+        let (input, input_refs) = blocking_input();
+        let work_dir = TempDir::new()?;
+        let writer = SortShuffleWriterExec::try_new(
+            JobId::new("jobOne"),
+            1,
+            input,
+            work_dir.path().to_str().unwrap().to_owned(),
+            Partitioning::Hash(vec![Arc::new(Column::new("a", 0))], 2),
+            SortShuffleConfig::default(),
+        )?;
+        assert_dropping_output_streams_stops_input(&writer, &input_refs).await
+    }
+
+    /// The range writer's coordinator also kept draining the input after its
+    /// `execute(N)` streams were dropped.
+    #[tokio::test]
+    async fn dropping_every_range_shuffle_output_stream_stops_the_write() -> Result<()> {
+        let (input, input_refs) = blocking_input();
+        // The range writer requires an ordered input. `SortExec` keeps each
+        // input stream open while it waits for the input to end.
+        let ordering = LexOrdering::new(vec![PhysicalSortExpr::new_default(Arc::new(
+            Column::new("a", 0),
+        ))])
+        .expect("one sort expression is a valid ordering");
+        let input =
+            Arc::new(SortExec::new(ordering, input).with_preserve_partitioning(true));
+        let work_dir = TempDir::new()?;
+        let writer = RangeShuffleWriterExec::try_new(
+            JobId::new("jobOne"),
+            1,
+            input,
+            work_dir.path().to_str().unwrap().to_owned(),
+        )?;
+        assert_dropping_output_streams_stops_input(&writer, &input_refs).await
+    }
+
+    /// A two-partition `BlockingExec`, whose streams never end, and a count of
+    /// the input plan and every stream opened from it.
+    fn blocking_input() -> (Arc<dyn ExecutionPlan>, Weak<()>) {
+        let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::UInt32, true)]));
+        let input = Arc::new(BlockingExec::new(schema, 2));
+        let input_refs = input.refs();
+        (input, input_refs)
+    }
+
+    /// Opens every output stream of `writer`, waits until the writer has opened
+    /// both input streams, drops the output streams, and waits until the input
+    /// streams are dropped too. The caller keeps `writer` alive. The executor
+    /// also keeps the plan after a cancel, to collect its metrics.
+    async fn assert_dropping_output_streams_stops_input(
+        writer: &dyn ExecutionPlan,
+        input_refs: &Weak<()>,
+    ) -> Result<()> {
+        let k = writer.properties().output_partitioning().partition_count();
+        let task_ctx = SessionContext::new().task_ctx();
+        {
+            let _streams = (0..k)
+                .map(|n| writer.execute(n, task_ctx.clone()))
+                .collect::<Result<Vec<_>>>()?;
+            // The input plan and one stream per input partition.
+            assert_strong_count_reaches(input_refs, 3).await;
+        }
+        assert_strong_count_reaches(input_refs, 1).await;
+        Ok(())
+    }
+
+    /// Waits until `refs` has `expected` strong references, and fails after
+    /// 10 seconds.
+    async fn assert_strong_count_reaches<T>(refs: &Weak<T>, expected: usize) {
+        let reached = tokio::time::timeout(Duration::from_secs(10), async {
+            while refs.strong_count() != expected {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        assert!(
+            reached.is_ok(),
+            "expected {expected} strong references, got {}",
+            refs.strong_count()
+        );
     }
 }

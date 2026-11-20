@@ -28,7 +28,6 @@ use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::common::tree_node::{Transformed, TreeNode, TreeNodeRecursion};
 use datafusion::datasource::MemTable;
 use datafusion::datasource::memory::MemorySourceConfig;
-use datafusion::execution::SessionStateBuilder;
 use datafusion::physical_plan::{ExecutionPlan, Partitioning};
 use datafusion::prelude::{SessionConfig, SessionContext};
 use std::sync::Arc;
@@ -80,17 +79,12 @@ async fn planner(
     config: SessionConfig,
     sql: &str,
 ) -> datafusion::common::Result<AdaptivePlanner> {
-    let ctx = SessionContext::new_with_state(
-        SessionStateBuilder::new_with_default_features()
-            .with_config(config)
-            .build(),
-    );
+    let ctx = SessionContext::new_with_config(config);
     for name in ["t1", "t2"] {
         let data = vec![vec![mock_batch()?]; 4];
         ctx.register_table(name, Arc::new(MemTable::try_new(mock_schema(), data)?))?;
     }
-    let plan = ctx.sql(sql).await?.into_optimized_plan()?;
-    AdaptivePlanner::try_new(&ctx, &plan, "test_job".into(), None).await
+    AdaptivePlanner::from_logical_sql(&ctx, sql, None).await
 }
 
 async fn join_stage(
@@ -236,7 +230,7 @@ async fn skew_join_preserves_shards_through_stage_completion()
         let output = planner.take_stage_output_partitions(stage_id)?;
         assert_eq!(output.len(), 7);
         assert_eq!(output.iter().map(Vec::len).sum::<usize>(), 7);
-        planner.resolve_stage_partitions(stage_id, output)?;
+        planner.resolve_stage_partitions(stage_id, output, Vec::new())?;
         assert!(planner.runnable_stages()?.is_none());
     }
     Ok(())
@@ -431,7 +425,7 @@ async fn skew_join_repartitions_partial_aggregates_for_the_next_stage()
     )?;
     let output = planner.take_stage_output_partitions(stage_id)?;
     assert_eq!(output.len(), 4);
-    planner.resolve_stage_partitions(stage_id, output)?;
+    planner.resolve_stage_partitions(stage_id, output, Vec::new())?;
     let final_stage = planner.runnable_stages()?.unwrap().remove(0);
     let inputs = readers(final_stage.plan);
     assert_eq!(inputs.len(), 1);

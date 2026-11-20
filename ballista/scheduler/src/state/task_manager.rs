@@ -38,13 +38,14 @@ use crate::state::task_builder::restrict_plan_to_partitions;
 use ballista_core::error::BallistaError;
 use ballista_core::error::Result;
 use ballista_core::execution_plans::compute_global_output_partition_ids;
+use ballista_core::execution_plans::plan_algebra::PartitionSliceableResolver;
 use ballista_core::extension::{SessionConfigExt, SessionConfigHelperExt};
 use ballista_core::serde::BallistaCodec;
 use ballista_core::serde::protobuf::{
     JobStatus, MultiTaskDefinition, TaskDefinition, TaskId, TaskStatus, job_status,
     task_status,
 };
-use ballista_core::serde::scheduler::{ExecutorMetadata, TaskKey};
+use ballista_core::serde::scheduler::{ExecutorMetadata, PartitionLocation, TaskKey};
 use ballista_core::{JobId, JobStatusSubscriber};
 use dashmap::DashMap;
 use datafusion::execution::config::SessionConfig;
@@ -155,6 +156,9 @@ pub struct TaskManager<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan>
     task_max_failures: usize,
     /// Maximum number of failure attempts for stage-level retry before the stage is considered failed.
     stage_max_failures: usize,
+    /// Resolver for nodes Ballista does not know. See
+    /// [`SchedulerConfig::partition_sliceable_resolver`].
+    partition_sliceable_resolver: Option<Arc<dyn PartitionSliceableResolver>>,
     /// See [`SchedulerConfig::adaptive_rules`].
     adaptive_rules: Option<Arc<dyn AdaptiveRules>>,
 }
@@ -188,6 +192,9 @@ pub struct ExecutorLostOutcome {
     pub tasks_to_cancel: Vec<RunningTaskInfo>,
     /// Jobs that must fail, with the reason and when they were queued.
     pub failed_jobs: Vec<(JobId, String, u64)>,
+    /// Jobs whose stages wait for `DataFrame::cache()` data lost with the
+    /// executor to be rebuilt, with the external stage ids of the lost reads.
+    pub lost_inputs: Vec<(JobId, Vec<usize>)>,
 }
 
 /// Tracks stage state changes during task status updates.
@@ -217,20 +224,16 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> TaskManager<T, U>
         scheduler_endpoint: String,
         config: Arc<SchedulerConfig>,
     ) -> Self {
-        Self {
+        Self::with_launcher(
             state,
             codec,
-            scheduler_id: scheduler_id.clone(),
-            active_job_cache: Arc::new(DashMap::new()),
-            outstanding_task_reservations: Arc::new(DashMap::new()),
-            launcher: Arc::new(DefaultTaskLauncher::new(scheduler_endpoint)),
-            task_max_failures: config.task_max_failures,
-            stage_max_failures: config.stage_max_failures,
-            adaptive_rules: config.adaptive_rules.clone(),
-        }
+            scheduler_id,
+            Arc::new(DefaultTaskLauncher::new(scheduler_endpoint)),
+            config,
+        )
     }
 
-    #[allow(dead_code)]
+    /// Creates a new `TaskManager` that launches its tasks with `launcher`.
     pub(crate) fn with_launcher(
         state: Arc<dyn JobState>,
         codec: BallistaCodec<T, U>,
@@ -247,6 +250,7 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> TaskManager<T, U>
             launcher,
             task_max_failures: config.task_max_failures,
             stage_max_failures: config.stage_max_failures,
+            partition_sliceable_resolver: config.partition_sliceable_resolver.clone(),
             adaptive_rules: config.adaptive_rules.clone(),
         }
     }
@@ -300,8 +304,25 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> TaskManager<T, U>
         let mut planner = DefaultDistributedPlanner::new();
         let session_state = ctx.state();
         let session_config = session_state.config();
-        let pipelined = session_config.ballista_config().execution_mode()?
+        let pipelined = session_config.ballista_execution_mode()?
             == ballista_core::config::ExecutionMode::Pipelined;
+
+        // Semi join reduction needs the size of each candidate dimension, so it
+        // runs here, before planning, rather than as an optimizer rule.
+        let reduced_plan;
+        let plan = match plan {
+            SubmitPlan::Logical(logical_plan) => {
+                reduced_plan = SubmitPlan::Logical(
+                    ballista_core::optimizer::apply_semi_join_reduction(
+                        &session_state,
+                        logical_plan,
+                    )
+                    .await?,
+                );
+                &reduced_plan
+            }
+            SubmitPlan::Physical(_) => plan,
+        };
 
         let mut graph = match plan {
             // A pipelined job plans with the static planner whatever the AQE
@@ -386,23 +407,35 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> TaskManager<T, U>
                 }
             }
             SubmitPlan::Physical(physical_plan) => {
-                // AQE plans from the logical plan, so an already-built
-                // physical plan always uses the static planner, including when
-                // AQE is on (the default).
-                debug!("Using static query planner for physical-plan job submission");
-                let session_config = Arc::new(ctx.copied_config());
+                if session_config.ballista_adaptive_query_planner_enabled() {
+                    debug!(
+                        "Using adaptive query planner (AQE) for physical-plan job submission"
+                    );
+                    Box::new(AdaptiveExecutionGraph::try_new_from_physical(
+                        &self.scheduler_id,
+                        job_id,
+                        job_name,
+                        &ctx,
+                        physical_plan.clone(),
+                        queued_at,
+                        self.adaptive_rules.as_deref(),
+                    )?) as ExecutionGraphBox
+                } else {
+                    debug!("Using static query planner for physical-plan job submission");
+                    let session_config = Arc::new(ctx.copied_config());
 
-                Box::new(StaticExecutionGraph::new(
-                    &self.scheduler_id,
-                    job_id,
-                    job_name,
-                    &ctx.session_id(),
-                    physical_plan.clone(),
-                    queued_at,
-                    session_config,
-                    &mut planner,
-                    None,
-                )?) as ExecutionGraphBox
+                    Box::new(StaticExecutionGraph::new(
+                        &self.scheduler_id,
+                        job_id,
+                        job_name,
+                        &ctx.session_id(),
+                        physical_plan.clone(),
+                        queued_at,
+                        session_config,
+                        &mut planner,
+                        None,
+                    )?) as ExecutionGraphBox
+                }
             }
         };
         let string_plan =
@@ -444,9 +477,10 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> TaskManager<T, U>
         .await
     }
 
-    /// Submit an already-built physical plan for distributed execution. The physical
-    /// plan is planned with the static distributed planner; adaptive query planning
-    /// (AQE) is not available for this path.
+    /// Submit an already-built physical plan for distributed execution. The plan
+    /// goes through adaptive query planning (AQE) when
+    /// `ballista.planner.adaptive.enabled` is set, and through the static
+    /// distributed planner otherwise, like a logical submission.
     #[allow(clippy::too_many_arguments)]
     pub async fn submit_physical_plan(
         &self,
@@ -654,6 +688,42 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> TaskManager<T, U>
             })
             .map(|(_, vcores)| vcores)
             .sum()
+    }
+
+    /// Return bound-but-never-launched tasks to pending in their job graphs.
+    ///
+    /// Complements [`Self::take_task_reservations`]: after a metadata miss
+    /// the vcore budget is refunded, but the tasks themselves were already
+    /// recorded as `Running` at bind time. Without this reset they stay
+    /// stranded until the executor is lost (#2691).
+    pub(crate) async fn reset_unlaunched_tasks(
+        &self,
+        executor_id: &str,
+        tasks: &[TaskDescription],
+    ) -> usize {
+        let mut by_job: HashMap<JobId, Vec<&TaskDescription>> = HashMap::new();
+        for task in tasks {
+            by_job
+                .entry(task.key.job_id.clone())
+                .or_default()
+                .push(task);
+        }
+        let mut reset = 0;
+        for (job_id, job_tasks) in by_job {
+            let Some(graph) = self.get_active_execution_graph(&job_id) else {
+                warn!(
+                    "Fail to find job {job_id} in the active cache while resetting unlaunched tasks"
+                );
+                continue;
+            };
+            let mut graph = graph.write().await;
+            for task in job_tasks {
+                if graph.reset_unlaunched_task(task, executor_id) {
+                    reset += 1;
+                }
+            }
+        }
+        reset
     }
 
     /// Update given task statuses in the respective job and return a tuple containing:
@@ -910,11 +980,14 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> TaskManager<T, U>
 
     /// Handles executor loss by resetting affected tasks and stages.
     ///
-    /// Returns the running tasks that need to be cancelled, and the jobs that
-    /// cannot survive the loss and must fail, with the reason. A pipelined
-    /// job is one: its tasks stream to each other, so there is nothing to
-    /// roll back to. So is a job that lost `DataFrame::cache()` data with the
-    /// executor: its graph cannot re-run another job's output.
+    /// Returns the running tasks that need to be cancelled, the jobs that
+    /// cannot survive the loss and must fail, with the reason, and the jobs
+    /// whose stages now wait for `DataFrame::cache()` data to be rebuilt. A
+    /// pipelined job must fail: its tasks stream to each other, so there is
+    /// nothing to roll back to. So must a job that lost cache data and whose
+    /// graph cannot resume after it is rebuilt. A job whose rollback itself
+    /// fails is failed too: its graph is half-reset and can no longer make
+    /// progress, and the remaining jobs still need their tasks back.
     pub async fn executor_lost(&self, executor_id: &str) -> Result<ExecutorLostOutcome> {
         // Its capacity has been removed, so there is nothing left to refund.
         // Do this even for evicted jobs and before a graph reset can fail.
@@ -930,31 +1003,68 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> TaskManager<T, U>
             let lost_pipelined = graph
                 .as_pipelined_mut()
                 .map(|pipelined| pipelined.lost_executor(executor_id));
-            let reason = if graph.reads_external_data_on(executor_id) {
-                Some(format!(
+            let reason = if !graph.recovers_external_inputs()
+                && graph.reads_external_data_on(executor_id)
+            {
+                format!(
                     "Job {job_id} {CACHE_DATA_LOST} on executor {executor_id}; retry the query"
-                ))
-            } else if let Some(reason) = lost_pipelined {
+                )
+            } else if let Some(Some(reason)) = lost_pipelined {
                 reason
             } else {
-                let reset = graph.reset_stages_on_lost_executor(executor_id)?;
-                if !reset.0.is_empty() {
-                    outcome.tasks_to_cancel.extend(reset.1);
+                // The reset drops the executor's cache locations like any
+                // other, and rolls back the stages reading them. A pipelined
+                // job the loss leaves intact drops them only until it is
+                // placed, and rolls nothing back.
+                let waiting_before = graph.waiting_external_inputs();
+                match graph.reset_stages_on_lost_executor(executor_id) {
+                    Ok(reset) => {
+                        if !reset.0.is_empty() {
+                            outcome.tasks_to_cancel.extend(reset.1);
+                        }
+                        let inputs: Vec<usize> = graph
+                            .waiting_external_inputs()
+                            .into_iter()
+                            .filter(|input| !waiting_before.contains(input))
+                            .collect();
+                        if !inputs.is_empty() {
+                            outcome.lost_inputs.push((job_id.clone(), inputs));
+                        }
+                        continue;
+                    }
+                    // A failed rollback leaves the graph half-reset and it can
+                    // never make progress again, so fail the job rather than
+                    // hang it — and keep recovering the remaining jobs.
+                    Err(e) => format!(
+                        "Job {job_id} failed to roll back after the loss of \
+                         executor {executor_id}: {e}"
+                    ),
                 }
-                continue;
             };
-            if let Some(reason) = reason {
-                let queued_at = match &graph.status().status {
-                    Some(job_status::Status::Running(running)) => running.queued_at,
-                    _ => 0,
-                };
-                outcome
-                    .failed_jobs
-                    .push((job_id.clone(), reason, queued_at));
-            }
+            let queued_at = match &graph.status().status {
+                Some(job_status::Status::Running(running)) => running.queued_at,
+                _ => 0,
+            };
+            outcome
+                .failed_jobs
+                .push((job_id.clone(), reason, queued_at));
         }
 
         Ok(outcome)
+    }
+
+    /// Provides `job_id`'s lost external input `input` again, at `locations`,
+    /// and returns the events to post. Nothing to do if the job has ended.
+    pub(crate) async fn resolve_external_input(
+        &self,
+        job_id: &JobId,
+        input: usize,
+        locations: Vec<Vec<PartitionLocation>>,
+    ) -> Result<Vec<QueryStageSchedulerEvent>> {
+        match self.get_active_execution_graph(job_id) {
+            Some(graph) => graph.write().await.resolve_external_input(input, locations),
+            None => Ok(vec![]),
+        }
     }
 
     /// Retrieves the number of available tasks for the given job.
@@ -976,6 +1086,8 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> TaskManager<T, U>
     /// ShuffleReader partitions) to this task's assigned slice, then encoded
     /// fresh. No shared-plan cache — each task gets its own bytes because
     /// each task's plan is different.
+    ///
+    /// Fails if the plan holds a leaf that cannot be restricted to the slice.
     #[allow(dead_code)]
     pub fn prepare_task_definition(
         &self,
@@ -990,6 +1102,7 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> TaskManager<T, U>
             let restricted = restrict_plan_to_partitions(
                 task.plan.clone(),
                 &task.global_input_partition_ids,
+                self.partition_sliceable_resolver.as_deref(),
             )?;
             let mut plan_buf: Vec<u8> = vec![];
             let plan_proto = PhysicalPlanNode::try_from_physical_plan(
@@ -1030,40 +1143,40 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> TaskManager<T, U>
 
     /// Launch the given tasks on the specified executor.
     ///
-    /// Returns the jobs that cannot run: those the executor rejected, and
-    /// those whose task definitions could not be prepared here. Tasks of the
-    /// latter were never sent anywhere and will never report a status, so the
-    /// caller has to fail the job and refund the tasks' slots, exactly as for a
-    /// rejection. `Err` is only for the launch RPC itself failing, which says
-    /// the executor is sick, not the plan.
+    /// Returns the jobs that cannot run: those whose task definitions could not
+    /// be prepared here, each with the preparation error, and those the
+    /// executor rejected. Tasks of the former were never sent anywhere and will
+    /// never report a status, so the caller has to fail the job and refund the
+    /// tasks' slots, exactly as for a rejection. `Err` is only for the launch
+    /// RPC itself failing, which says the executor is sick, not the plan.
     pub(crate) async fn launch_multi_task(
         &self,
         executor: &ExecutorMetadata,
         tasks: Vec<Vec<TaskDescription>>,
         executor_manager: &ExecutorManager,
-    ) -> Result<HashSet<JobId>> {
+    ) -> Result<(HashMap<JobId, String>, HashSet<JobId>)> {
         let mut multi_tasks = vec![];
-        let mut failed_jobs = HashSet::new();
+        let mut unprepared_jobs = HashMap::new();
         for stage_tasks in tasks {
             let job_id = stage_tasks.first().map(|task| task.key.job_id.clone());
             match self.prepare_multi_task_definition(stage_tasks) {
                 Ok(stage_tasks) => multi_tasks.extend(stage_tasks),
                 Err(e) => {
                     error!("Fail to prepare task definition: {e:?}");
-                    failed_jobs.extend(job_id);
+                    unprepared_jobs.extend(job_id.map(|job_id| (job_id, e.to_string())));
                 }
             }
         }
 
-        if !multi_tasks.is_empty() {
-            failed_jobs.extend(
-                self.launcher
-                    .launch_tasks(executor, multi_tasks, executor_manager)
-                    .await?,
-            );
-        }
+        let rejected_jobs = if multi_tasks.is_empty() {
+            HashSet::new()
+        } else {
+            self.launcher
+                .launch_tasks(executor, multi_tasks, executor_manager)
+                .await?
+        };
 
-        Ok(failed_jobs)
+        Ok((unprepared_jobs, rejected_jobs))
     }
 
     #[allow(dead_code)]
@@ -1111,6 +1224,7 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> TaskManager<T, U>
             let restricted = restrict_plan_to_partitions(
                 task.plan.clone(),
                 &task.global_input_partition_ids,
+                self.partition_sliceable_resolver.as_deref(),
             )?;
             let mut plan_buf: Vec<u8> = vec![];
             let plan_proto = PhysicalPlanNode::try_from_physical_plan(restricted, codec)?;
@@ -1307,8 +1421,11 @@ mod tests {
     use super::*;
     use crate::cluster::JobStateEventStream;
     use crate::cluster::memory::InMemoryJobState;
+    use crate::state::execution_graph::ExecutionGraph;
     use crate::test_utils::{
-        mock_completed_task, mock_executor, test_aggregation_plan,
+        drain_tasks_with_executor, fail_plan_rewrites, join_aggregate_sort_logical_plan,
+        mock_completed_task, mock_executor,
+        revive_graph_and_complete_next_stage_with_executor, test_aggregation_plan,
         test_aggregation_plan_with_job_id,
     };
     use ballista_core::serde::protobuf::job_status::Status;
@@ -1444,6 +1561,14 @@ mod tests {
                 .await
         }
 
+        async fn new_context(
+            &self,
+            session_id: &str,
+            config: &SessionConfig,
+        ) -> Result<Arc<SessionContext>> {
+            self.inner.new_context(session_id, config).await
+        }
+
         async fn remove_session(&self, session_id: &str) -> Result<()> {
             self.inner.remove_session(session_id).await
         }
@@ -1490,14 +1615,7 @@ mod tests {
             // contains Running until terminal persistence updates it.
             let mut graph = active_graph.write().await;
             let executor = mock_executor("executor-1".to_string());
-            while let Some(task) = graph.pop_next_task(&executor.id)? {
-                graph.update_task_status(
-                    &executor,
-                    vec![mock_completed_task(task, &executor.id)],
-                    1,
-                    1,
-                )?;
-            }
+            drain_tasks_with_executor(graph.as_mut(), &executor)?;
             graph.succeed_job()?;
         }
 
@@ -1509,11 +1627,6 @@ mod tests {
         use crate::cluster::bind_task_bias;
         use crate::state::execution_graph::ExecutionGraph;
         use ballista_core::serde::protobuf::AvailableVcores;
-        use datafusion::arrow::datatypes::{DataType, Field, Schema};
-        use datafusion::functions_aggregate::sum::sum;
-        use datafusion::logical_expr::SortExpr;
-        use datafusion::prelude::{JoinType, col};
-        use datafusion::test_util::scan_empty_with_partitions;
 
         let mut config = SessionConfig::new().with_target_partitions(2);
         config
@@ -1521,18 +1634,7 @@ mod tests {
             .optimizer
             .enable_round_robin_repartition = false;
         let ctx = SessionContext::new_with_config(config);
-        let schema = Schema::new(vec![
-            Field::new("id", DataType::Utf8, false),
-            Field::new("gmv", DataType::UInt64, false),
-        ]);
-        let left = scan_empty_with_partitions(Some("left"), &schema, None, 2)?;
-        let right =
-            scan_empty_with_partitions(Some("right"), &schema, None, 2)?.build()?;
-        let plan = left
-            .join(right, JoinType::Inner, (vec!["id"], vec!["id"]), None)?
-            .aggregate(vec![col("left.id")], vec![sum(col("left.gmv"))])?
-            .sort(vec![SortExpr::new(col("id"), false, false)])?
-            .build()?;
+        let plan = join_aggregate_sort_logical_plan();
         let job_id: JobId = "retired-task-refund".into();
         let mut graph = AdaptiveExecutionGraph::try_new(
             "scheduler",
@@ -1693,6 +1795,118 @@ mod tests {
         Ok(())
     }
 
+    /// Builds a two-stage aggregation graph whose first stage completed on
+    /// `executor` and whose second stage has a task running on it, so losing
+    /// the executor forces the second stage to roll back.
+    async fn graph_with_stage_two_running_on(
+        job_id: &JobId,
+        executor: &ExecutorMetadata,
+    ) -> Result<StaticExecutionGraph> {
+        let mut graph = test_aggregation_plan_with_job_id(2, job_id).await;
+        revive_graph_and_complete_next_stage_with_executor(&mut graph, executor)?;
+        graph.revive();
+        graph
+            .pop_next_task(&executor.id)?
+            .expect("second stage should have a task to assign");
+        Ok(graph)
+    }
+
+    /// Makes the running stage of `graph` impossible to roll back by wrapping
+    /// its plan in a node whose rewrite always fails.
+    fn fail_running_stage_rollback(graph: &mut StaticExecutionGraph) {
+        let running_stage_id = graph
+            .stages()
+            .iter()
+            .find_map(|(stage_id, stage)| {
+                matches!(stage, ExecutionStage::Running(_)).then_some(*stage_id)
+            })
+            .expect("graph should have a running stage");
+        match graph.stages_mut().get_mut(&running_stage_id) {
+            Some(ExecutionStage::Running(stage)) => {
+                fail_plan_rewrites(&mut stage.plan);
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    #[tokio::test]
+    async fn executor_lost_fails_job_instead_of_hanging_when_rollback_fails() -> Result<()>
+    {
+        let (manager, _, _, _) = setup_job(false).await?;
+        let dead = mock_executor("executor-dead".to_string());
+
+        let mut graph =
+            graph_with_stage_two_running_on(&"doomed-job".into(), &dead).await?;
+        fail_running_stage_rollback(&mut graph);
+        let job_id = graph.job_id().clone();
+        manager
+            .active_job_cache
+            .insert(job_id.clone(), JobInfoCache::new(Box::new(graph)));
+
+        let outcome = manager.executor_lost(&dead.id).await?;
+
+        let (_, reason, _) = outcome
+            .failed_jobs
+            .iter()
+            .find(|(failed_id, _, _)| *failed_id == job_id)
+            .expect("job whose rollback failed should be failed, not left hanging");
+        assert!(reason.contains("failed to roll back"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn executor_lost_recovers_other_jobs_when_one_rollback_fails() -> Result<()> {
+        let (manager, _, _, _) = setup_job(false).await?;
+        let dead = mock_executor("executor-dead".to_string());
+
+        let mut doomed_graph =
+            graph_with_stage_two_running_on(&"doomed-job".into(), &dead).await?;
+        fail_running_stage_rollback(&mut doomed_graph);
+        let doomed_job_id = doomed_graph.job_id().clone();
+        manager.active_job_cache.insert(
+            doomed_job_id.clone(),
+            JobInfoCache::new(Box::new(doomed_graph)),
+        );
+
+        let survivor_graph =
+            graph_with_stage_two_running_on(&"survivor-job".into(), &dead).await?;
+        let survivor_job_id = survivor_graph.job_id().clone();
+        manager.active_job_cache.insert(
+            survivor_job_id.clone(),
+            JobInfoCache::new(Box::new(survivor_graph)),
+        );
+
+        let outcome = manager.executor_lost(&dead.id).await?;
+
+        assert!(
+            outcome
+                .failed_jobs
+                .iter()
+                .any(|(job_id, _, _)| *job_id == doomed_job_id),
+            "doomed job should be failed"
+        );
+        assert!(
+            outcome
+                .failed_jobs
+                .iter()
+                .all(|(job_id, _, _)| *job_id != survivor_job_id),
+            "survivor job should not be failed"
+        );
+
+        let graph = manager
+            .get_active_execution_graph(&survivor_job_id)
+            .expect("survivor job should remain active");
+        let graph = graph.read().await;
+        assert!(
+            graph
+                .stages()
+                .values()
+                .any(|stage| matches!(stage, ExecutionStage::UnResolved(_))),
+            "survivor job's second stage should roll back to unresolved"
+        );
+        Ok(())
+    }
+
     #[tokio::test]
     async fn successful_job_stays_visible_and_unlocked_until_persisted() -> Result<()> {
         let (manager, state, job_id, active_graph) = setup_job(true).await?;
@@ -1738,10 +1952,9 @@ mod tests {
     /// nothing else would release it.
     #[tokio::test]
     async fn failed_terminal_save_still_releases_a_pipelined_reservation() -> Result<()> {
-        use crate::planner::DefaultDistributedPlanner;
         use crate::state::execution_graph::ExecutionGraph;
         use crate::state::pipelined_graph::{PlacementDecision, plan_placement};
-        use crate::test_utils::test_join_plan;
+        use crate::test_utils::{pipelined_graph_from_physical, test_join_plan};
         use ballista_core::serde::protobuf::AvailableVcores;
 
         let state = Arc::new(BlockingJobState::new());
@@ -1755,17 +1968,10 @@ mod tests {
             Arc::new(SchedulerConfig::default()),
         );
 
-        let mut graph = PipelinedExecutionGraph::new(
-            "localhost:50050",
-            &"job".into(),
-            "",
-            "session",
+        let mut graph = pipelined_graph_from_physical(
             test_join_plan(4).await.physical_plan(),
-            0,
-            Arc::new(SessionConfig::new_with_ballista()),
-            &mut DefaultDistributedPlanner::new(),
-            None,
-        )?;
+            SessionConfig::new_with_ballista(),
+        );
         let available: Vec<AvailableVcores> = ["a", "b"]
             .into_iter()
             .map(|id| AvailableVcores {

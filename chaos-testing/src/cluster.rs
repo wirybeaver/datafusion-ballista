@@ -16,7 +16,9 @@
 // under the License.
 
 use crate::fetch::ResultFetch;
+use crate::rest::find_stage;
 use nix::fcntl::{Flock, FlockArg};
+use std::collections::HashSet;
 use std::fs::{File, OpenOptions};
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
@@ -25,24 +27,24 @@ use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 use tokio::sync::{Mutex, OwnedMutexGuard};
 
-/// Reserve `N` free TCP ports by binding each to :0, releasing them only once
-/// every port has been read.
+/// Reserve `N` free TCP ports that are not in `taken`, and add them to `taken`.
 ///
-/// Holding all `N` listeners is what makes the ports distinct from each other.
-/// Releasing each before taking the next lets the kernel hand the same number
-/// back, and a caller that asked for two ports then gives its child one port
-/// for two servers: the second bind fails `AddrInUse` and the child exits
-/// during startup.
-///
-/// Still racy against the rest of the machine, which is adequate here: the
-/// child binds within milliseconds and the tests are the only thing running.
-fn free_ports<const N: usize>() -> [u16; N] {
-    let listeners: [TcpListener; N] = std::array::from_fn(|_| {
-        TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port")
-    });
-    listeners
-        .each_ref()
-        .map(|listener| listener.local_addr().expect("local addr").port())
+/// All listeners are held until every port has been read, so the ports of one
+/// call are distinct. `taken` keeps them distinct across calls: a child binds
+/// its ports only after this returns, so a later call could otherwise be handed
+/// a port the earlier child has not bound yet.
+fn reserve_ports<const N: usize>(taken: &mut HashSet<u16>) -> [u16; N] {
+    let mut held = Vec::new();
+    let mut fresh = Vec::with_capacity(N);
+    while fresh.len() < N {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
+        let port = listener.local_addr().expect("local addr").port();
+        if taken.insert(port) {
+            fresh.push(port);
+        }
+        held.push(listener);
+    }
+    fresh.try_into().expect("exactly N ports")
 }
 
 /// Open a child process log file for append.
@@ -65,18 +67,27 @@ fn open_log(path: &Path) -> std::io::Result<File> {
 /// `target/ci/` while the inference points at `target/release/`. Deriving the
 /// directory from `current_exe` is correct for any profile and honours
 /// `CARGO_TARGET_DIR` for free.
+///
+/// The depth of the test executable below the profile directory depends on
+/// Cargo's build-dir layout: `<target>/<profile>/deps/<test>` in the old
+/// layout, `<target>/<profile>/build/<pkg>/<hash>/.../<test>` in the new one
+/// (the default since Rust 1.100). Final binaries are uplifted to
+/// `<target>/<profile>/` in both, so walk up from the test executable and take
+/// the first ancestor directory that holds the binary.
 fn binary(name: &str) -> PathBuf {
-    let mut path = std::env::current_exe().expect("locate the test executable");
-    path.pop(); // deps/
-    path.pop(); // <target>/<profile>/
-    path.push(name);
-    assert!(
-        path.exists(),
-        "{} not found at {}. Run `cargo build -p ballista-chaos --bins` first.",
-        name,
-        path.display()
-    );
-    path
+    let exe = std::env::current_exe().expect("locate the test executable");
+    let file_name = format!("{name}{}", std::env::consts::EXE_SUFFIX);
+    exe.ancestors()
+        .skip(1)
+        .map(|dir| dir.join(&file_name))
+        .find(|path| path.is_file())
+        .unwrap_or_else(|| {
+            panic!(
+                "{name} not found in any ancestor of {}. \
+                 Run `cargo build -p ballista-chaos --bins` first.",
+                exe.display()
+            )
+        })
 }
 
 /// One supervised executor process.
@@ -195,14 +206,15 @@ impl TestClusterBuilder {
         eprintln!("chaos cluster fetches results via {result_fetch}");
         let result_service_enabled = result_fetch == ResultFetch::ResultService;
 
-        // Reserve the scheduler port and (when enabled) the result-service port
-        // together so they are distinct — see `free_ports`; separate calls could
-        // hand the same number to both.
+        // Every port handed to a process of this cluster goes through
+        // `assigned_ports`, so the scheduler, the result service and each
+        // executor get distinct ports — see `reserve_ports`.
+        let mut assigned_ports = HashSet::new();
         let (scheduler_port, result_service_port) = if result_service_enabled {
-            let [scheduler_port, rs_port] = free_ports();
+            let [scheduler_port, rs_port] = reserve_ports(&mut assigned_ports);
             (scheduler_port, Some(rs_port))
         } else {
-            let [scheduler_port] = free_ports();
+            let [scheduler_port] = reserve_ports(&mut assigned_ports);
             (scheduler_port, None)
         };
 
@@ -293,6 +305,7 @@ impl TestClusterBuilder {
             result_service_port,
             result_fetch,
             executors: Vec::new(),
+            assigned_ports,
             temp,
             log_dir,
             builder: self,
@@ -334,6 +347,9 @@ pub struct TestCluster {
     result_service_port: Option<u16>,
     result_fetch: ResultFetch,
     pub(crate) executors: Vec<ExecutorHandle>,
+    /// Every port handed to a process of this cluster so far, including those
+    /// of executors that have since died. See [`reserve_ports`].
+    assigned_ports: HashSet<u16>,
     temp: tempfile::TempDir,
     log_dir: PathBuf,
     builder: TestClusterBuilder,
@@ -407,9 +423,11 @@ impl TestCluster {
     }
 
     pub(crate) fn spawn_executor(&mut self, index: usize) -> Result<(), String> {
-        // One call, so the two are guaranteed distinct: the executor binds
-        // its flight server to `port` and its gRPC server to `grpc_port`.
-        let [port, grpc_port] = free_ports();
+        // The executor binds its flight server to `port` and its gRPC server
+        // to `grpc_port`. Both are distinct from each other and from every
+        // port already given to this cluster, including those of an executor
+        // spawned a moment ago that may not have bound its ports yet.
+        let [port, grpc_port] = reserve_ports(&mut self.assigned_ports);
         let work_dir = self.temp.path().join(format!("executor-{index}"));
         std::fs::create_dir_all(&work_dir).map_err(|e| e.to_string())?;
 
@@ -653,8 +671,14 @@ impl TestCluster {
         job_id: &str,
         stage_id: usize,
     ) -> Result<(), String> {
-        self.await_stage_task_state(job_id, stage_id, "Running")
-            .await
+        crate::rest::await_stage_task_state(
+            &self.client,
+            &self.rest_url(),
+            job_id,
+            stage_id,
+            "Running",
+        )
+        .await
     }
 
     /// Block until any task in any stage is Running.
@@ -673,8 +697,14 @@ impl TestCluster {
         job_id: &str,
         stage_id: usize,
     ) -> Result<(), String> {
-        self.await_stage_task_state(job_id, stage_id, "Successful")
-            .await
+        crate::rest::await_stage_task_state(
+            &self.client,
+            &self.rest_url(),
+            job_id,
+            stage_id,
+            "Successful",
+        )
+        .await
     }
 
     /// Block until every task in `stage_id` is Successful.
@@ -701,34 +731,6 @@ impl TestCluster {
                 return Err(format!("timed out waiting for stage {stage_id} to succeed"));
             }
             tokio::time::sleep(Duration::from_millis(50)).await;
-        }
-    }
-
-    async fn await_stage_task_state(
-        &self,
-        job_id: &str,
-        stage_id: usize,
-        state: &str,
-    ) -> Result<(), String> {
-        let deadline = Instant::now() + Duration::from_secs(60);
-        loop {
-            let stages = self.stages(job_id).await?;
-            if let Some(stage) = find_stage(&stages, stage_id)
-                && let Some(tasks) = stage.get("tasks").and_then(|t| t.as_array())
-            {
-                let hit = tasks
-                    .iter()
-                    .any(|t| t.get("status").and_then(|s| s.as_str()) == Some(state));
-                if hit {
-                    return Ok(());
-                }
-            }
-            if Instant::now() > deadline {
-                return Err(format!(
-                    "timed out waiting for a {state} task in stage {stage_id}"
-                ));
-            }
-            tokio::time::sleep(Duration::from_millis(25)).await;
         }
     }
 
@@ -905,13 +907,6 @@ impl TestCluster {
     }
 }
 
-/// Stage ids come back from the REST API as strings.
-fn find_stage(stages: &serde_json::Value, stage_id: usize) -> Option<&serde_json::Value> {
-    stages.get("stages")?.as_array()?.iter().find(|s| {
-        s.get("stage_id").and_then(|v| v.as_str()) == Some(stage_id.to_string().as_str())
-    })
-}
-
 fn dir_has_entries(path: &Path) -> bool {
     std::fs::read_dir(path)
         .map(|mut entries| entries.next().is_some())
@@ -986,11 +981,33 @@ mod tests {
     /// reserving the ports one at a time, which is what allows a repeat.
     #[test]
     fn ports_reserved_together_are_distinct() {
-        let ports = free_ports::<16>();
+        let ports: [u16; 16] = reserve_ports(&mut HashSet::new());
         let mut seen = std::collections::HashSet::new();
         for port in ports {
             assert!(seen.insert(port), "port {port} handed out twice: {ports:?}");
         }
+    }
+
+    /// Ports already handed out are never handed out again, even after their
+    /// listeners are gone. This is the executor-startup race: executor 0's
+    /// ports are released before its process binds them, and the next
+    /// reservation must not pick one of them up.
+    #[test]
+    fn reserved_ports_skip_ports_already_taken() {
+        let mut taken = HashSet::new();
+        let first: [u16; 8] = reserve_ports(&mut taken);
+        // The listeners behind `first` are closed, so the kernel is free to
+        // hand those numbers out again; only `taken` keeps them away.
+        for _ in 0..64 {
+            let next: [u16; 2] = reserve_ports(&mut taken);
+            for port in next {
+                assert!(
+                    !first.contains(&port),
+                    "port {port} reserved twice: {first:?} then {next:?}"
+                );
+            }
+        }
+        assert_eq!(taken.len(), 8 + 64 * 2);
     }
 
     #[tokio::test]
