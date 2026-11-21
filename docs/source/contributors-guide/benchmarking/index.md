@@ -137,6 +137,12 @@ Spark <spark>
 Spark + Comet <comet>
 Trino <trino>
 DataFusion Distributed <datafusion-distributed>
+Storage partition joins: validation harness <storage-partition-join-validation>
+Storage partition joins: acceptance record <storage-partition-join-acceptance>
+Storage partition joins: equal-layout checkpoint <storage-partition-join-equal>
+Storage partition joins <storage-partition-join>
+Storage partition joins: SF10 Q12 over HTTP <storage-partition-join-sf10>
+Storage partition joins: verified cold/warm caches <storage-partition-join-cache>
 ```
 
 ## Recording a new result set

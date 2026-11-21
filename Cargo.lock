@@ -1015,6 +1015,7 @@ dependencies = [
  "futures",
  "log",
  "rstest",
+ "serde_json",
  "tempfile",
  "tokio",
  "tonic",
