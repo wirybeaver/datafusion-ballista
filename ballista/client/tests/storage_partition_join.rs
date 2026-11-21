@@ -20,6 +20,7 @@
 use ballista::prelude::{SessionConfigExt, SessionContextExt};
 use ballista_core::config::{
     BALLISTA_HASH_JOIN_MAX_BUILD_PARTITION_BYTES, BALLISTA_STORAGE_PARTITION_JOIN,
+    BALLISTA_STORAGE_PARTITION_JOIN_DIVISOR,
 };
 use ballista_core::storage_partitioning::{
     BucketFile, BucketedParquetManifest, BucketedParquetTable,
@@ -150,6 +151,7 @@ fn config(enabled: bool, sort: bool) -> SessionConfig {
     SessionConfig::new_with_ballista()
         .with_target_partitions(12)
         .set_bool(BALLISTA_STORAGE_PARTITION_JOIN, enabled)
+        .set_bool(BALLISTA_STORAGE_PARTITION_JOIN_DIVISOR, enabled)
         .set_u64(
             BALLISTA_HASH_JOIN_MAX_BUILD_PARTITION_BYTES,
             if sort { 1 } else { 0 },
@@ -189,7 +191,7 @@ async fn run(ctx: &SessionContext, query: &str) -> String {
 async fn storage_partition_join_matches_shuffle() {
     let dir = input_directory();
     let a = table(dir.path(), "a", 8, 1, 40);
-    let b = table(dir.path(), "b", 8, 2, 40);
+    let b = table(dir.path(), "b", 4, 2, 40);
     let c = table(dir.path(), "c", 8, 3, 40);
     let incompatible = table(dir.path(), "incompatible", 6, 2, 40);
     let empty = Arc::new(
@@ -257,14 +259,14 @@ async fn storage_partition_join_matches_shuffle() {
             );
         }
         // Exercise SQL EXPLAIN through provider transport and the scheduler's
-        // real AQE path, including the storage-group selection reason.
+        // real AQE path. A static-planner explanation misses the divisor rule.
         let explained = run(&ctx, "EXPLAIN SELECT a.id FROM a JOIN b ON a.id=b.id").await;
         assert!(
-            explained.contains("selected: compatible storage groups"),
+            explained.contains("selected: aligned 8/4 buckets"),
             "{explained}"
         );
         assert!(
-            explained.contains("effective_groups=9, effective_buckets=8"),
+            explained.contains("effective_groups=5, effective_buckets=4"),
             "{explained}"
         );
         let fallback =

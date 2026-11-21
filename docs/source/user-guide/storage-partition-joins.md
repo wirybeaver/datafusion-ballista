@@ -74,21 +74,77 @@ partition evolution, or cross-table snapshot isolation. It does not infer
 bucketing from filenames. Register the required object store on the scheduler
 and executors as for ordinary Ballista file scans.
 
-## Enable equal-layout storage joins
+## Enable planning and divisor grouping
 
-The session setting `ballista.optimizer.storage_partition_join` defaults to
-`false`. Opt in with `SessionConfig::new_with_ballista().set_bool(
-"ballista.optimizer.storage_partition_join", true)`.
+Both optimization settings default to `false`. Set them in the session
+configuration used to create the Ballista context:
 
-The production AQE planner recognizes ordinary inner equi-joins whose inputs
-have the same fully specified scheme and ordered group identities. Both Hash
-Join and Sort-Merge Join are supported. Existing broadcast decisions remain
-available. Different layouts, unsupported keys, and unsupported join semantics
-retain ordinary planning. AQE preserves aligned source groups during replan;
-projection without a key drops the distribution guarantee.
+```rust
+let config = SessionConfig::new_with_ballista()
+    .set_bool("ballista.optimizer.storage_partition_join", true)
+    .set_bool("ballista.optimizer.storage_partition_join_divisor", true);
+```
 
-`EXPLAIN` reports the initial adaptive plan and each storage-group decision,
-including the effective group count. Runtime statistics may change subsequent
-AQE choices. `EXPLAIN ANALYZE` shows executed stages and their ordinary scan,
-join, and exchange metrics. Partition-dependent dynamic filtering does not
-assume native hash routing for externally grouped inputs.
+The production AQE planner aligns ordinary inner equi-joins on the supported
+bucketing key before it creates exchanges. It uses the existing Hash Join or
+Sort-Merge Join selection; source-provided per-group row counts allow the
+existing hash-build-size budget to select Sort-Merge Join when appropriate.
+Unknown source-group size also selects Sort-Merge Join when that budget is
+enabled; setting the budget to zero explicitly opts into Hash Join.
+
+Equal layouts match their semantic scheme and ordered group IDs. With divisor
+grouping enabled, compatible 8/4 layouts combine the larger side's buckets
+`{i, i+4}` with the smaller side's bucket `i`. NULL groups stay separate. File
+groups are rebuilt before sorting; no global bucket-index arithmetic is sent
+to an executor. Unsupported grouping rewrites, incompatible layouts, and
+non-divisor counts retain the normal repartitioning path.
+
+Divisor grouping reduces parallelism. The deployment can reject a merge below
+`ballista.optimizer.storage_partition_join_min_buckets` non-null buckets
+(default `1`, allowing all compatible counts). For example, a minimum of `8`
+rejects an 8→4 merge and keeps the normal repartitioned join. Policy rejection
+is reported separately from incompatible transforms. This is an explicit
+parallelism constraint, not a general cost model or a promise that every
+divisible layout is faster. Measure the workload before enabling it broadly.
+Parent operators can still need their own exchange even when the join inputs do not.
+
+The provider reports whole-scan as well as per-group statistics. A known-small
+build remains eligible for the existing broadcast policy; that decision is
+checked before regrouping the probe, preserving its original parallelism.
+Source grouping is distinct from a join that already requested a shuffle.
+
+`EXPLAIN` uses the initial AQE plan when adaptive planning is enabled. Its
+`distributed_plan` row includes each join's storage-group decision, scheme,
+effective execution-group count (including the null group), and effective
+non-null bucket count. Rejections distinguish unsupported semantics/layouts
+from disabled divisor alignment, the minimum-bucket policy, and an existing
+broadcast choice. For example, an 8/4 alignment reports
+`selected: aligned 8/4 buckets`, `effective_groups=5`, and
+`effective_buckets=4`. Runtime statistics can change subsequent AQE decisions;
+`EXPLAIN ANALYZE` shows the executed stages and their metrics.
+
+AQE coalescing conservatively preserves stages containing storage groups,
+including mixtures of an inline scan and a passthrough exchange. It also
+preserves ordered exchanges because concatenating their sorted partitions
+would lose the advertised ordering. Native unordered downstream shuffles
+remain eligible for ordinary coalescing.
+
+## Inspect and validate
+
+`EXPLAIN` shows `Grouped(scheme, group_ids, count)` on eligible scans. In a
+compatible join, its input exchange is absent; with incompatible layouts the
+usual exchange remains. Grouped properties are distinct from native hash
+routing, including after projection and downstream joins. Partition-dependent
+dynamic filtering is conservatively disabled for multi-group source joins.
+
+Enable the storage-join optimizer's debug log to see divisor alignment and
+fallback decisions. `EXPLAIN ANALYZE`
+provides ordinary scan, join, and shuffle metrics. Storage reads and shuffle
+traffic are separate costs.
+
+The integration fixture uses real Parquet data, duplicate keys, nulls,
+asymmetric empty buckets, several files per group, both join algorithms,
+downstream native joins, and projection without the bucket key. It compares
+rows with an ordinary-shuffle oracle. Planner coverage separately verifies that
+exchanges are actually removed and that disabling divisor support restores
+them.

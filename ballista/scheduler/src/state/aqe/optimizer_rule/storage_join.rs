@@ -19,13 +19,25 @@
 
 use crate::state::aqe::execution_plan::{DynamicJoinSelectionExec, JoinSelectionAction};
 use ballista_core::config::BallistaConfig;
-use ballista_core::storage_partitioning::iceberg_bucket_count;
+use ballista_core::storage_partitioning::{
+    bucket_group_id, iceberg_bucket_count, with_group_statistics,
+};
 use datafusion::common::config::ConfigOptions;
 use datafusion::common::tree_node::{Transformed, TransformedResult, TreeNode};
 use datafusion::common::{JoinType, Result};
+use datafusion::datasource::physical_plan::{
+    FileGroup, FileScanConfig, FileScanConfigBuilder,
+};
+use datafusion::datasource::source::DataSourceExec;
 use datafusion::physical_expr::GroupedPartitioning;
 use datafusion::physical_optimizer::PhysicalOptimizerRule;
-use datafusion::physical_plan::{ExecutionPlan, ExecutionPlanProperties, Partitioning};
+use datafusion::physical_plan::filter::FilterExec;
+use datafusion::physical_plan::projection::ProjectionExec;
+use datafusion::physical_plan::sorts::sort::SortExec;
+use datafusion::physical_plan::{
+    ExecutionPlan, ExecutionPlanProperties, Partitioning, replace_children_if_necessary,
+};
+use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 
 /// Query-local decisions collected only while planning EXPLAIN. Recording at
@@ -168,7 +180,138 @@ fn align_join(
         record("selected: compatible storage groups", Some(left));
         return Ok(Transformed::no(plan));
     }
-    unchanged("fallback: storage layouts differ")
+    let (Some(left_buckets), Some(right_buckets)) = (
+        iceberg_bucket_count(left.scheme()),
+        iceberg_bucket_count(right.scheme()),
+    ) else {
+        return unchanged("fallback: no compatible transform adapter");
+    };
+    let target = left_buckets.min(right_buckets);
+    let prefix_left = left.scheme().rsplit_once(":buckets=").unwrap().0;
+    let prefix_right = right.scheme().rsplit_once(":buckets=").unwrap().0;
+    if prefix_left != prefix_right {
+        return unchanged("fallback: incompatible bucket schemes");
+    }
+    if !left_buckets.max(right_buckets).is_multiple_of(target) {
+        return unchanged("fallback: non-divisor bucket counts");
+    }
+    if left_buckets != right_buckets && !config.storage_partition_join_divisor_enabled() {
+        return unchanged("policy: divisor alignment disabled");
+    }
+    if left_buckets != right_buckets
+        && (target as usize) < config.storage_partition_join_min_buckets()
+    {
+        return unchanged(&format!(
+            "policy: effective_buckets={target} below minimum_buckets={}",
+            config.storage_partition_join_min_buckets()
+        ));
+    }
+    let scheme = format!("{prefix_left}:buckets={target}");
+    let ids = left
+        .group_ids()
+        .iter()
+        .chain(right.group_ids())
+        .map(|id| normalized_id(id, target))
+        .collect::<Result<BTreeSet<_>>>()?
+        .into_iter()
+        .collect::<Vec<_>>();
+    let Some(new_left) = regroup(&join.left, &scheme, &ids, target)? else {
+        return unchanged("fallback: left input cannot be regrouped");
+    };
+    let Some(new_right) = regroup(&join.right, &scheme, &ids, target)? else {
+        return unchanged("fallback: right input cannot be regrouped");
+    };
+    if let Partitioning::Grouped(grouping) = new_left.output_partitioning() {
+        record(
+            &format!("selected: aligned {left_buckets}/{right_buckets} buckets"),
+            Some(grouping),
+        );
+    }
+    Ok(Transformed::yes(replace_children_if_necessary(
+        plan,
+        vec![new_left, new_right],
+    )?))
+}
+
+fn normalized_id(id: &[u8], buckets: u32) -> Result<Vec<u8>> {
+    if id.is_empty() {
+        return Ok(bucket_group_id(None));
+    }
+    let bytes: [u8; 4] = id.try_into().map_err(|_| {
+        datafusion::common::plan_datafusion_err!("Invalid Iceberg bucket group label")
+    })?;
+    Ok(bucket_group_id(Some(u32::from_be_bytes(bytes) % buckets)))
+}
+
+fn regroup(
+    plan: &Arc<dyn ExecutionPlan>,
+    scheme: &str,
+    ids: &[Vec<u8>],
+    buckets: u32,
+) -> Result<Option<Arc<dyn ExecutionPlan>>> {
+    if let Some(scan) = plan.downcast_ref::<DataSourceExec>() {
+        let Some(config) = scan.data_source().downcast_ref::<FileScanConfig>() else {
+            return Ok(None);
+        };
+        let Some(Partitioning::Grouped(grouped)) = &config.output_partitioning else {
+            return Ok(None);
+        };
+        // Per-partition row limits cannot move below a bucket merge: merging
+        // first would select a different set of rows.
+        if config.limit.is_some() {
+            return Ok(None);
+        }
+        let slots: HashMap<_, _> = ids
+            .iter()
+            .enumerate()
+            .map(|(i, id)| (id.clone(), i))
+            .collect();
+        let mut files: Vec<FileGroup> =
+            ids.iter().map(|_| FileGroup::default()).collect();
+        for (id, group) in grouped.group_ids().iter().zip(&config.file_groups) {
+            let index = slots[&normalized_id(id, buckets)?];
+            for file in group.iter() {
+                files[index].push(file.clone());
+            }
+        }
+        let files = files
+            .into_iter()
+            .map(|group| {
+                with_group_statistics(
+                    group,
+                    config.file_source().table_schema().table_schema(),
+                )
+            })
+            .collect();
+        let partitioning = Partitioning::Grouped(GroupedPartitioning::try_new(
+            grouped.keys().to_vec(),
+            scheme.to_owned(),
+            ids.to_vec(),
+        )?);
+        // Concatenating old groups does not preserve cross-file sort order.
+        let config = FileScanConfigBuilder::from(config.clone())
+            .with_file_groups(files)
+            .with_output_ordering(vec![])
+            .with_output_partitioning(Some(partitioning))
+            .build();
+        return Ok(Some(DataSourceExec::from_data_source(config)));
+    }
+    let preserves = plan.is::<FilterExec>()
+        || plan.is::<ProjectionExec>()
+        || plan
+            .downcast_ref::<SortExec>()
+            .is_some_and(|sort| sort.preserve_partitioning() && sort.fetch().is_none());
+    if !preserves {
+        return Ok(None);
+    }
+    let children = plan.children();
+    let Some(child) = regroup(children[0], scheme, ids, buckets)? else {
+        return Ok(None);
+    };
+    Ok(Some(replace_children_if_necessary(
+        Arc::clone(plan),
+        vec![child],
+    )?))
 }
 
 #[cfg(test)]
@@ -177,6 +320,7 @@ mod tests {
     use crate::state::aqe::planner::AdaptivePlanner;
     use ballista_core::config::{
         BALLISTA_HASH_JOIN_MAX_BUILD_PARTITION_BYTES, BALLISTA_STORAGE_PARTITION_JOIN,
+        BALLISTA_STORAGE_PARTITION_JOIN_DIVISOR,
     };
     use ballista_core::extension::SessionConfigExt;
     use ballista_core::storage_partitioning::{
@@ -209,12 +353,14 @@ mod tests {
     async fn planned(
         left: u32,
         right: u32,
+        divisor: bool,
         sort: bool,
         num_rows: Option<usize>,
     ) -> String {
         let config = SessionConfig::new_with_ballista()
             .with_target_partitions(16)
             .set_bool(BALLISTA_STORAGE_PARTITION_JOIN, true)
+            .set_bool(BALLISTA_STORAGE_PARTITION_JOIN_DIVISOR, divisor)
             .set_u64(
                 BALLISTA_HASH_JOIN_MAX_BUILD_PARTITION_BYTES,
                 if sort { 1 } else { 0 },
@@ -360,8 +506,75 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn singleton_scans_are_not_regrouped_on_non_bucket_keys() {
+        use crate::state::task_builder::restrict_plan_to_partitions;
+        use datafusion::catalog::TableProvider;
+        use datafusion::physical_expr::{PhysicalExpr, expressions::Column};
+        use datafusion::physical_plan::joins::{HashJoinExecBuilder, PartitionMode};
+
+        let config = SessionConfig::new_with_ballista()
+            .set_bool(BALLISTA_STORAGE_PARTITION_JOIN, true)
+            .with_ballista_broadcast_join_threshold_bytes(0);
+        let ctx = SessionContext::new_with_config(config.clone());
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("v", DataType::Int64, false),
+        ]));
+        let mut scans = Vec::new();
+        // Valid source-pruned layouts: one remaining bucket on each side.
+        // Their storage key is id, while the join below compares v.
+        for bucket in [3, 0] {
+            let provider = BucketedParquetTable::try_new(
+                schema.clone(),
+                BucketedParquetManifest {
+                    object_store_url: "file://".into(),
+                    key: "id".into(),
+                    buckets: 4,
+                    files: vec![BucketFile {
+                        path: format!("planning-bucket-{bucket}.parquet"),
+                        size: 128,
+                        bucket: Some(bucket),
+                        num_rows: Some(1),
+                    }],
+                },
+            )
+            .unwrap();
+            let scan = provider.scan(&ctx.state(), None, &[], None).await.unwrap();
+            scans.push(restrict_plan_to_partitions(scan, &[bucket as usize]).unwrap());
+        }
+        let key = Arc::new(Column::new("v", 1)) as Arc<dyn PhysicalExpr>;
+        let hash = HashJoinExecBuilder::new(
+            scans[0].clone(),
+            scans[1].clone(),
+            vec![(key.clone(), key)],
+            JoinType::Inner,
+        )
+        .with_partition_mode(PartitionMode::Partitioned)
+        .build()
+        .unwrap();
+        let join = DynamicJoinSelectionExec::from_hash_join(&hash, 0).unwrap();
+        let diagnostics = StorageJoinDiagnostics::default();
+        let optimized = StoragePartitionJoinRule {
+            diagnostics: Some(diagnostics.clone()),
+        }
+        .optimize(join, config.options())
+        .unwrap();
+        for (input, bucket) in optimized.children().into_iter().zip([3, 0]) {
+            let Partitioning::Grouped(grouped) = input.output_partitioning() else {
+                panic!("source grouping was lost");
+            };
+            assert_eq!(grouped.group_ids(), &[bucket_group_id(Some(bucket))]);
+        }
+        assert!(
+            diagnostics
+                .render()
+                .contains("join keys do not match storage keys")
+        );
+    }
+
+    #[tokio::test]
     async fn production_planner_preserves_storage_groups_before_exchanges() {
-        let equal = planned(4, 4, false, Some(32)).await;
+        let equal = planned(4, 4, false, false, Some(32)).await;
         assert!(equal.contains("HashJoinExec"), "{equal}");
         assert!(!equal.contains("ExchangeExec"), "{equal}");
         assert!(
@@ -372,24 +585,40 @@ mod tests {
             equal.contains("effective_groups=5, effective_buckets=4"),
             "{equal}"
         );
-        let sorted = planned(4, 4, true, Some(32)).await;
-        assert!(sorted.contains("SortMergeJoinExec"), "{sorted}");
-        assert!(!sorted.contains("ExchangeExec"), "{sorted}");
-        let unknown_size = planned(4, 4, true, None).await;
+        let divisor = planned(8, 4, true, true, Some(32)).await;
+        assert!(divisor.contains("SortMergeJoinExec"), "{divisor}");
+        assert!(!divisor.contains("ExchangeExec"), "{divisor}");
+        assert!(!divisor.contains("buckets=8"), "{divisor}");
+        assert!(
+            divisor.contains("selected: aligned 8/4 buckets"),
+            "{divisor}"
+        );
+        assert!(
+            divisor.contains("effective_groups=5, effective_buckets=4"),
+            "{divisor}"
+        );
+        let unknown_size = planned(4, 4, false, true, None).await;
         assert!(unknown_size.contains("SortMergeJoinExec"), "{unknown_size}");
         assert!(!unknown_size.contains("ExchangeExec"), "{unknown_size}");
-        let fallback = planned(8, 4, false, Some(32)).await;
+        let fallback = planned(8, 4, false, false, Some(32)).await;
         assert!(fallback.contains("ExchangeExec"), "{fallback}");
         assert!(
-            fallback.contains("fallback: storage layouts differ"),
+            fallback.contains("policy: divisor alignment disabled"),
             "{fallback}"
         );
+        let incompatible = planned(6, 4, true, false, Some(32)).await;
+        assert!(
+            incompatible.contains("fallback: non-divisor bucket counts"),
+            "{incompatible}"
+        );
+        assert!(incompatible.contains("ExchangeExec"), "{incompatible}");
     }
     #[tokio::test]
     async fn tiny_storage_build_keeps_broadcast_and_probe_buckets() {
         let config = SessionConfig::new_with_ballista()
             .with_target_partitions(16)
             .set_bool(BALLISTA_STORAGE_PARTITION_JOIN, true)
+            .set_bool(BALLISTA_STORAGE_PARTITION_JOIN_DIVISOR, true)
             .with_ballista_broadcast_join_threshold_bytes(1024)
             .set_u64(
                 "datafusion.optimizer.hash_join_single_partition_threshold",
@@ -417,6 +646,34 @@ mod tests {
         assert!(!explained.contains("partitioning=Hash"), "{explained}");
         assert!(
             explained.contains("policy: broadcast selected; preserve probe parallelism"),
+            "{explained}"
+        );
+    }
+    #[tokio::test]
+    async fn divisor_policy_can_preserve_join_parallelism() {
+        use ballista_core::config::BALLISTA_STORAGE_PARTITION_JOIN_MIN_BUCKETS;
+        let config = SessionConfig::new_with_ballista()
+            .with_target_partitions(16)
+            .set_bool(BALLISTA_STORAGE_PARTITION_JOIN, true)
+            .set_bool(BALLISTA_STORAGE_PARTITION_JOIN_DIVISOR, true)
+            .set_u64(BALLISTA_STORAGE_PARTITION_JOIN_MIN_BUCKETS, 8)
+            .with_ballista_broadcast_join_threshold_bytes(0);
+        let ctx = SessionContext::new_with_config(config);
+        ctx.register_table("a", source(8, Some(32))).unwrap();
+        ctx.register_table("b", source(4, Some(32))).unwrap();
+        let logical = ctx
+            .sql("select a.id from a join b on a.id=b.id")
+            .await
+            .unwrap()
+            .into_optimized_plan()
+            .unwrap();
+        let explained = AdaptivePlanner::explain(&ctx, &logical, "parallel_spj".into())
+            .await
+            .unwrap();
+        assert!(explained.contains("ExchangeExec"), "{explained}");
+        assert!(explained.contains("buckets=8"), "{explained}");
+        assert!(
+            explained.contains("policy: effective_buckets=4 below minimum_buckets=8"),
             "{explained}"
         );
     }
