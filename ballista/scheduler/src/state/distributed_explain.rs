@@ -20,7 +20,9 @@ use std::fmt::Write as _;
 use std::sync::Arc;
 
 use ballista_core::JobId;
+use ballista_core::config::BallistaConfig;
 use ballista_core::error::Result;
+use ballista_core::extension::SessionConfigExt;
 use datafusion::arrow::array::{ListArray, ListBuilder, StringBuilder};
 use datafusion::arrow::datatypes::{DataType, Field, Schema};
 use datafusion::common::{ScalarValue, UnnestOptions};
@@ -36,6 +38,7 @@ use datafusion::physical_plan::projection::ProjectionExec;
 use datafusion::physical_plan::unnest::{ListUnnest, UnnestExec};
 use datafusion::prelude::SessionContext;
 
+use crate::state::aqe::planner::AdaptivePlanner;
 use crate::state::execution_graph::ExecutionStage;
 use crate::{
     planner::{DefaultDistributedPlanner, DistributedPlanner},
@@ -49,15 +52,37 @@ pub(crate) async fn generate_distributed_explain_plan(
 ) -> Result<String> {
     let session_config = Arc::new(session_ctx.copied_config());
 
-    let plan = session_ctx.state().create_physical_plan(&plan).await?;
+    let mut explanation = if session_config.ballista_adaptive_query_planner_enabled() {
+        // EXPLAIN's inner plan is not another EXPLAIN. Boxing breaks the async
+        // type recursion through AdaptivePlanner::try_new and handle_explain_plan.
+        Box::pin(AdaptivePlanner::explain(session_ctx, &plan, job_id.clone())).await?
+    } else {
+        let plan = session_ctx.state().create_physical_plan(&plan).await?;
+        let mut planner = DefaultDistributedPlanner::new();
+        let shuffle_stages =
+            planner.plan_query_stages(job_id, plan, session_config.options())?;
+        let builder = ExecutionStageBuilder::new(session_config.clone());
+        render_stages(builder.build(shuffle_stages)?)
+    };
+    if let Some(config) = session_config.options().extensions.get::<BallistaConfig>()
+        && config.storage_partition_join_enabled()
+    {
+        // These modes suppress source grouping before the join rule can see
+        // it. Explain that activation gate even when no dynamic join is built.
+        let reason = if !config.adaptive_query_planner_enabled() {
+            Some("adaptive planner disabled")
+        } else if !config.adaptive_join_enabled() {
+            Some("adaptive join selection disabled")
+        } else {
+            None
+        };
+        if let Some(reason) = reason {
+            explanation
+                .insert_str(0, &format!("StoragePartitionJoin: fallback: {reason}\n"));
+        }
+    }
 
-    let mut planner = DefaultDistributedPlanner::new();
-    let shuffle_stages =
-        planner.plan_query_stages(job_id, plan, session_config.options())?;
-    let builder = ExecutionStageBuilder::new(session_config.clone());
-    let stages = builder.build(shuffle_stages)?;
-
-    Ok(render_stages(stages))
+    Ok(explanation)
 }
 
 pub(crate) fn extract_logical_and_physical_plans(

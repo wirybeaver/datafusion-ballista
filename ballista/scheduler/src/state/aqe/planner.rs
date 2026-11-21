@@ -24,7 +24,8 @@ use crate::state::aqe::optimizer_rule::chaos_exec::ChaosCreatingRule;
 use crate::state::aqe::optimizer_rule::{
     CoalescePartitionsRule, DelayJoinSelectionRule, DemoteUnsafeBroadcastJoinRule,
     DistributedExchangeRule, NormalizeInterleaveRule, ParallelWindowRule,
-    PrefixWindowRule, PropagateEmptyExecRule, SelectJoinRule,
+    PrefixWindowRule, PropagateEmptyExecRule, SelectJoinRule, StorageJoinDiagnostics,
+    StoragePartitionJoinRule,
 };
 use crate::state::distributed_explain::handle_explain_plan;
 use crate::state::execution_stage::StageOutput;
@@ -132,6 +133,33 @@ impl AdaptivePlanner {
         logical_plan: &LogicalPlan,
         job_id: JobId,
     ) -> common::Result<Self> {
+        Self::try_new_internal(ctx, logical_plan, job_id, None).await
+    }
+
+    /// Explain the initial adaptive plan using the same rules as execution.
+    /// Later runtime statistics may change join selection during replanning.
+    pub(crate) async fn explain(
+        ctx: &SessionContext,
+        logical_plan: &LogicalPlan,
+        job_id: JobId,
+    ) -> common::Result<String> {
+        let diagnostics = StorageJoinDiagnostics::default();
+        let planner =
+            Self::try_new_internal(ctx, logical_plan, job_id, Some(diagnostics.clone()))
+                .await?;
+        let decisions = diagnostics.render();
+        Ok(format!(
+            "Initial adaptive plan:\n{decisions}\n{}",
+            displayable(planner.plan.as_ref()).indent(false)
+        ))
+    }
+
+    async fn try_new_internal(
+        ctx: &SessionContext,
+        logical_plan: &LogicalPlan,
+        job_id: JobId,
+        diagnostics: Option<StorageJoinDiagnostics>,
+    ) -> common::Result<Self> {
         // session state with very limited set of optimizers.
         // this optimizer set will be executed only once, before
         // running standard set of optimizers, which will
@@ -157,7 +185,7 @@ impl AdaptivePlanner {
             state_builder,
             plan,
             job_id,
-            Self::default_optimizers(plan_id_generator),
+            Self::default_optimizers(plan_id_generator, diagnostics),
         )
     }
     /// Cancels a stage by its ID.
@@ -471,21 +499,16 @@ impl AdaptivePlanner {
     /// A vector of default physical optimizer rules.
     pub(super) fn default_optimizers(
         plan_id_generator: Arc<AtomicUsize>,
+        diagnostics: Option<StorageJoinDiagnostics>,
     ) -> Vec<PhysicalOptimizerRuleRef> {
-        let mut physical_optimizers: Vec<Arc<dyn PhysicalOptimizerRule + Send + Sync>> =
-            vec![];
-
-        // Must run first: the rules below rewrite union branches independently,
-        // which an InterleaveExec cannot survive. EnforceDistribution re-forms
-        // the interleave later in this same chain when it is still valid.
-        physical_optimizers.push(Arc::new(NormalizeInterleaveRule::default()));
-
-        // changing plan before other built in optimizers kick in
-        physical_optimizers.push(Arc::new(PropagateEmptyExecRule::default()));
-
-        // select actual join implementation based on current runtime information
-        physical_optimizers
-            .push(Arc::new(SelectJoinRule::new(plan_id_generator.clone())));
+        let mut physical_optimizers: Vec<Arc<dyn PhysicalOptimizerRule + Send + Sync>> = vec![
+            // Normalize before rules rewrite union branches independently.
+            Arc::new(NormalizeInterleaveRule::default()),
+            Arc::new(PropagateEmptyExecRule::default()),
+            // Establish storage groups before join selection creates exchanges.
+            Arc::new(StoragePartitionJoinRule { diagnostics }),
+            Arc::new(SelectJoinRule::new(plan_id_generator.clone())),
+        ];
 
         // add default datafusion set of optimizers
         // physical_optimizers.extend(

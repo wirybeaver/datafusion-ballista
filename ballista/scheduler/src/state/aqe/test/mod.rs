@@ -72,7 +72,7 @@ impl AdaptivePlanner {
             state_builder,
             plan,
             job_id,
-            Self::default_optimizers(plan_id_generator),
+            Self::default_optimizers(plan_id_generator, None),
         )
     }
 

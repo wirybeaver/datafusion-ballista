@@ -187,11 +187,17 @@ impl TableProvider for BucketedParquetTable {
             .into_iter()
             .map(|group| with_group_statistics(group, &self.schema))
             .collect();
+        // Unsupported planner modes retain the ordinary scan distribution,
+        // even if the session requests the storage-join optimization.
         let enabled = state
             .config_options()
             .extensions
             .get::<BallistaConfig>()
-            .is_some_and(|config| config.storage_partition_join_enabled());
+            .is_some_and(|config| {
+                config.storage_partition_join_enabled()
+                    && config.adaptive_query_planner_enabled()
+                    && config.adaptive_join_enabled()
+            });
         let partitioning = if enabled {
             let key = Column::new_with_schema(&self.manifest.key, &self.schema)?;
             let ty = self.schema.field(key.index()).data_type();
