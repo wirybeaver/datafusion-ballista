@@ -15,6 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
+mod bucket_affinity;
+
 use crate::cluster::memory::{
     InMemoryCacheState, InMemoryClusterState, InMemoryJobState,
 };
@@ -615,6 +617,7 @@ fn bind_one(
     job_id: &JobId,
     budget: &mut AvailableVcores,
     resolver: Option<&dyn PartitionSliceableResolver>,
+    partition_limit: usize,
 ) -> Option<BoundTask> {
     if running_stage.pending.is_empty() {
         return None;
@@ -635,7 +638,7 @@ fn bind_one(
         .map(|bc| bc.max_partitions_per_task())
         .filter(|&n| n > 0)
         .unwrap_or(usize::MAX);
-    let split_max = (budget.vcores as usize).min(cap);
+    let split_max = (budget.vcores as usize).min(cap).min(partition_limit);
     // The union check rewrites the plan, so it runs only when it can change
     // the outcome (the pending partitions don't fit in one slice anyway), and
     // the stage keeps its answer for later binds.
@@ -833,6 +836,7 @@ async fn bind_tasks_with(
                     job_id,
                     &mut *budgets[idx],
                     job_info.partition_sliceable_resolver.as_deref(),
+                    usize::MAX,
                 ) {
                     Some(bound) => {
                         schedulable_tasks.push(bound);
@@ -1166,9 +1170,14 @@ mod test {
         };
         let mut bound = vec![];
         while budget.vcores > 0 {
-            let Some((_, task)) =
-                bind_one(stage, "session", &"job".into(), &mut budget, resolver)
-            else {
+            let Some((_, task)) = bind_one(
+                stage,
+                "session",
+                &"job".into(),
+                &mut budget,
+                resolver,
+                usize::MAX,
+            ) else {
                 break;
             };
             bound.push((task.global_input_partition_ids, task.vcores_consumed));
