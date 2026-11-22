@@ -37,3 +37,7 @@ pub use parallel_window::*;
 pub use pin_submitted_shuffles::*;
 pub use prefix_window::*;
 pub use propagate_empty::*;
+
+mod storage_join;
+pub(crate) use storage_join::StorageJoinDiagnostics;
+pub use storage_join::StoragePartitionJoinRule;

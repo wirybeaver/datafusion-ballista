@@ -144,7 +144,7 @@ use datafusion::physical_plan::sorts::sort::SortExec;
 use datafusion::physical_plan::sorts::sort_preserving_merge::SortPreservingMergeExec;
 use datafusion::physical_plan::union::{InterleaveExec, UnionExec};
 use datafusion::physical_plan::windows::{BoundedWindowAggExec, WindowAggExec};
-use datafusion::physical_plan::{ExecutionPlan, ExecutionPlanProperties};
+use datafusion::physical_plan::{ExecutionPlan, ExecutionPlanProperties, Partitioning};
 use log::debug;
 
 use crate::state::aqe::coalesce::{
@@ -215,7 +215,7 @@ impl PhysicalOptimizerRule for CoalescePartitionsRule {
         let mut leaves: Vec<Arc<dyn ExecutionPlan>> = Vec::new();
         if !collect_alignment_group(&input, &mut leaves) {
             debug!(
-                "[coalesce-rule] an operator of unknown partition-count sensitivity consumes a leaf; bail"
+                "[coalesce-rule] storage groups or an operator of unknown partition-count sensitivity consumes a leaf; bail"
             );
             return Ok(plan);
         }
@@ -375,6 +375,10 @@ fn collect_alignment_group(
     node: &Arc<dyn ExecutionPlan>,
     leaves: &mut Vec<Arc<dyn ExecutionPlan>>,
 ) -> bool {
+    // Exchange coalescing cannot reshape inline source groups with it.
+    if matches!(node.output_partitioning(), Partitioning::Grouped(_)) {
+        return false;
+    }
     if node.is::<ExchangeExec>() {
         leaves.push(Arc::clone(node));
         return true;
