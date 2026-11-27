@@ -1479,6 +1479,15 @@ message RunningTaskInfo {
   uint32 stage_id = 3;
 }
 
+message FetchRuntimeFilterParams {
+  string job_id = 1;
+  uint64 filter_id = 2;
+}
+
+message FetchRuntimeFilterResult {
+  RuntimeFilterPayload payload = 1;
+}
+
 service SchedulerGrpc {
   // Executors must poll the scheduler for heartbeat and to receive tasks
   rpc PollWork (PollWorkParams) returns (PollWorkResult) {}
@@ -1502,6 +1511,9 @@ service SchedulerGrpc {
   rpc GetJobStatus (GetJobStatusParams) returns (GetJobStatusResult) {}
 
   rpc GetJobMetrics (GetJobMetricsParams) returns (GetJobMetricsResult) {}
+
+  // Executors may request a pending filter without blocking task execution.
+  rpc FetchRuntimeFilter (FetchRuntimeFilterParams) returns (FetchRuntimeFilterResult) {}
 
   // Used by Executor to tell Scheduler it is stopped.
   rpc ExecutorStopped (ExecutorStoppedParams) returns (ExecutorStoppedResult) {}

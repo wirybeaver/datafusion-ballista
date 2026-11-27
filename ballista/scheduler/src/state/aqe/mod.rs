@@ -40,7 +40,8 @@ use ballista_core::serde::BallistaPhysicalExtensionCodec;
 use ballista_core::serde::protobuf::failed_task::FailedReason;
 use ballista_core::serde::protobuf::job_status::Status;
 use ballista_core::serde::protobuf::{
-    FailedJob, JobStatus, RunningJob, SuccessfulJob, TaskStatus, job_status, task_status,
+    FailedJob, JobStatus, RunningJob, RuntimeFilterPayload, SuccessfulJob, TaskStatus,
+    job_status, task_status,
 };
 use ballista_core::serde::scheduler::{
     ExecutorEndpoint, ExecutorMetadata, PartitionLocation,
@@ -1326,6 +1327,19 @@ impl ExecutionGraph for AdaptiveExecutionGraph {
         })
     }
 
+    fn subscribe_runtime_filter(
+        &mut self,
+        filter_id: u64,
+    ) -> ballista_core::error::Result<
+        Option<tokio::sync::watch::Receiver<Option<RuntimeFilterPayload>>>,
+    > {
+        if let Some(registry) = &mut self.runtime_filters {
+            Ok(registry.subscribe(filter_id, &self.stages)?)
+        } else {
+            Ok(None)
+        }
+    }
+
     /// Return all the currently running stage ids
     fn running_stages(&self) -> Vec<usize> {
         self.stages
@@ -1495,6 +1509,9 @@ impl ExecutionGraph for AdaptiveExecutionGraph {
         if let Some(ExecutionStage::Running(stage)) = self.stages.remove(&stage_id) {
             self.stages
                 .insert(stage_id, ExecutionStage::Successful(stage.to_successful()));
+            if let Some(registry) = &mut self.runtime_filters {
+                registry.publish(stage_id, &self.stages[&stage_id]);
+            }
             self.clear_stage_failure(stage_id);
             true
         } else {
@@ -1595,6 +1612,7 @@ impl ExecutionGraph for AdaptiveExecutionGraph {
 
     /// fail job with error message
     fn fail_job(&mut self, error: String) {
+        self.runtime_filters = None;
         self.end_time = timestamp_millis();
 
         self.status = JobStatus {

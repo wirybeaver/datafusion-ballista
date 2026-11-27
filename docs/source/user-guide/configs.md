@@ -174,11 +174,14 @@ SET ballista.planner.runtime_filter.enabled = true;
 ```
 
 Filters use the first join key when it is a supported column, including NULL-safe
-equality. Probe stages never wait: complete reports are used, otherwise bypassed.
+equality. Probe stages start immediately. If the build is still running, eligible
+Parquet readers pass rows through the pending join predicate until the complete
+summary arrives. Subsequent batches use its exact IN set or Bloom. Other scans
+receive the same update in `RuntimeFilterApplyExec`.
 Broadcast joins (such as TPC-H Q19) and partitioned fallback joins can use
 filters from a completed build. Eligible Parquet readers evaluate small IN sets first,
 then ordinary scan predicates, then join Blooms, before materializing the
-remaining columns. Other scans use the bound `RuntimeFilterApplyExec` on their output.
+remaining columns.
 `EXPLAIN ANALYZE` shows the scan predicate and
 `pushdown_rows_pruned`. Filters do not cross LIMIT or aggregates.
 

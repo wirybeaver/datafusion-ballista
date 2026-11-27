@@ -21,9 +21,9 @@
 //! Missing/partial reports are never interpreted as empty filters. The scheduler
 //! unions all successful producer tasks before specializing a probe stage.
 
-use std::collections::{BTreeMap, BTreeSet, btree_map::Entry};
+use std::collections::{BTreeMap, BTreeSet, HashMap, btree_map::Entry};
 use std::fmt::{self, Formatter};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use datafusion::arrow::array::{ArrayRef, BooleanArray, RecordBatch};
 use datafusion::arrow::compute::filter_record_batch;
@@ -33,8 +33,9 @@ use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
 use datafusion::common::{Result, ScalarValue, Statistics, internal_err};
 use datafusion::execution::TaskContext;
 use datafusion::functions_aggregate::min_max::{MaxAccumulator, MinAccumulator};
-use datafusion::logical_expr::{Accumulator, ColumnarValue};
+use datafusion::logical_expr::{Accumulator, ColumnarValue, Operator};
 use datafusion::physical_expr::PhysicalExpr;
+use datafusion::physical_expr::expressions::{BinaryExpr, InListExpr, IsNullExpr, lit};
 use datafusion::physical_plan::execution_plan::CardinalityEffect;
 use datafusion::physical_plan::metrics::{
     ExecutionPlanMetricsSet, MetricBuilder, MetricsSet,
@@ -44,8 +45,10 @@ use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, ExecutionPlanProperties, PlanProperties,
     SendableRecordBatchStream,
 };
+use futures::future::BoxFuture;
 use futures::{StreamExt, TryStreamExt};
 use parking_lot::Mutex;
+use tokio::{sync::watch, task::JoinHandle};
 
 use crate::serde::protobuf::RuntimeFilterPayload;
 
@@ -465,8 +468,111 @@ impl ExecutionPlan for RuntimeFilterBuildExec {
     }
 }
 
-/// Probe-side filtering. A missing payload passes through without evaluating
-/// the key; a complete payload is fixed for the lifetime of the task.
+struct FilterDelivery {
+    result: watch::Receiver<Option<Arc<RuntimeFilter>>>,
+    fetch: JoinHandle<()>,
+}
+
+/// Executor-side handle for a job's runtime filter. Only its id crosses the wire.
+#[derive(Clone)]
+struct RuntimeFilterHandle {
+    id: u64,
+    ready: OnceLock<Arc<RuntimeFilter>>,
+    delivery: Option<Arc<FilterDelivery>>,
+}
+
+impl RuntimeFilterHandle {
+    fn new(id: u64) -> Self {
+        Self {
+            id,
+            ready: OnceLock::new(),
+            delivery: None,
+        }
+    }
+
+    fn subscribe(mut self, source: &RuntimeFilterSource) -> Self {
+        self.delivery = Some(source.subscribe(self.id));
+        self
+    }
+
+    /// Look up the complete summary without waiting. Cache its first publication.
+    fn received(&self) -> Option<&RuntimeFilter> {
+        if let Some(filter) = self.ready.get() {
+            return Some(filter);
+        }
+        let arrived = self.delivery.as_ref()?.result.borrow().clone()?;
+        Some(self.ready.get_or_init(|| arrived))
+    }
+
+    fn apply_or_pass<B, T>(
+        &self,
+        batch: B,
+        pass: impl FnOnce(B) -> T,
+        apply: impl FnOnce(B, &RuntimeFilter) -> Result<T>,
+    ) -> Result<T> {
+        match self.received() {
+            Some(filter) => apply(batch, filter),
+            None => Ok(pass(batch)),
+        }
+    }
+}
+
+impl Drop for FilterDelivery {
+    fn drop(&mut self) {
+        self.fetch.abort();
+    }
+}
+type FetchFilter =
+    dyn Fn(u64) -> BoxFuture<'static, Option<RuntimeFilterPayload>> + Send + Sync;
+
+/// Task-scoped delivery of late filters, shared by all its input partitions.
+pub struct RuntimeFilterSource {
+    fetch: Box<FetchFilter>,
+    filters: Mutex<HashMap<u64, Arc<FilterDelivery>>>,
+}
+
+impl RuntimeFilterSource {
+    /// Create a source that fetches a complete filter or returns no filter.
+    pub fn new(
+        fetch: impl Fn(u64) -> BoxFuture<'static, Option<RuntimeFilterPayload>>
+        + Send
+        + Sync
+        + 'static,
+    ) -> Self {
+        Self {
+            fetch: Box::new(fetch),
+            filters: Mutex::new(HashMap::new()),
+        }
+    }
+
+    fn subscribe(&self, id: u64) -> Arc<FilterDelivery> {
+        self.filters
+            .lock()
+            .entry(id)
+            .or_insert_with(|| {
+                let delivery = (self.fetch)(id);
+                let (send, result) = watch::channel(None);
+                let fetch = tokio::spawn(async move {
+                    if let Some(payload) = delivery.await {
+                        match RuntimeFilter::from_proto(&payload) {
+                            Ok(filter) => {
+                                send.send_replace(Some(Arc::new(filter)));
+                            }
+                            Err(error) => {
+                                log::warn!(
+                                    "Could not apply runtime filter {id}: {error}"
+                                );
+                            }
+                        }
+                    }
+                });
+                Arc::new(FilterDelivery { result, fetch })
+            })
+            .clone()
+    }
+}
+
+/// Probe-side filtering. Input passes through until a complete filter arrives.
 #[derive(Debug)]
 pub struct RuntimeFilterApplyExec {
     input: Arc<dyn ExecutionPlan>,
@@ -582,19 +688,44 @@ impl ExecutionPlan for RuntimeFilterApplyExec {
         partition: usize,
         ctx: Arc<TaskContext>,
     ) -> Result<SendableRecordBatchStream> {
-        let input = self.input.execute(partition, ctx)?;
-        let Some(filter) = self.filter.clone() else {
-            return Ok(input);
+        let filter = if let Some(ready) = &self.filter {
+            RuntimeFilterHandle {
+                id: self.filter_id,
+                ready: OnceLock::from(ready.clone()),
+                delivery: None,
+            }
+        } else if let Some(source) =
+            ctx.session_config().get_extension::<RuntimeFilterSource>()
+        {
+            RuntimeFilterHandle::new(self.filter_id).subscribe(&source)
+        } else {
+            return self.input.execute(partition, ctx);
         };
+        let input = self.input.execute(partition, ctx)?;
         let key = self.key.clone();
         let pruned = MetricBuilder::new(&self.metrics).counter("rows_pruned", partition);
+        let unfiltered = filter.delivery.as_ref().map(|_| {
+            MetricBuilder::new(&self.metrics).counter("rows_before_filter", partition)
+        });
         let stream = input.map(move |batch| {
-            let batch = batch?;
-            let keys = key.evaluate(&batch)?.into_array(batch.num_rows())?;
-            let keep = probe_mask(&keys, |hash, is_null| filter.contains(hash, is_null))?;
-            let filtered = filter_record_batch(&batch, &keep)?;
-            pruned.add(batch.num_rows() - filtered.num_rows());
-            Ok(filtered)
+            filter.apply_or_pass(
+                batch?,
+                |batch| {
+                    if let Some(unfiltered) = &unfiltered {
+                        unfiltered.add(batch.num_rows());
+                    }
+                    batch
+                },
+                |batch, filter| {
+                    let keys = key.evaluate(&batch)?.into_array(batch.num_rows())?;
+                    let keep = probe_mask(&keys, |hash, is_null| {
+                        filter.contains(hash, is_null)
+                    })?;
+                    let filtered = filter_record_batch(&batch, &keep)?;
+                    pruned.add(batch.num_rows() - filtered.num_rows());
+                    Ok(filtered)
+                },
+            )
         });
         Ok(Box::pin(RecordBatchStreamAdapter::new(
             self.schema(),
@@ -712,6 +843,180 @@ impl PhysicalExpr for RuntimeFilterBloomExpr {
     }
 }
 
+/// Position at which a late runtime filter belongs in a reader's predicates.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum PendingFilterKind {
+    /// Exact typed IN, evaluated before ordinary row predicates.
+    In,
+    /// Bloom membership, evaluated after ordinary row predicates.
+    Bloom,
+}
+
+/// Pass-through predicate until its task receives a matching complete filter.
+pub struct PendingRuntimeFilterExpr {
+    key: Arc<dyn PhysicalExpr>,
+    kind: PendingFilterKind,
+    // Each rewritten key has its own compiled IN expression.
+    exact: OnceLock<Arc<dyn PhysicalExpr>>,
+    filter: RuntimeFilterHandle,
+}
+
+impl PendingRuntimeFilterExpr {
+    /// Create an unbound predicate for transport with the probe plan.
+    pub fn new(
+        key: Arc<dyn PhysicalExpr>,
+        filter_id: u64,
+        kind: PendingFilterKind,
+    ) -> Self {
+        Self {
+            key,
+            kind,
+            exact: OnceLock::new(),
+            filter: RuntimeFilterHandle::new(filter_id),
+        }
+    }
+
+    /// Which representation this predicate can evaluate.
+    pub fn kind(&self) -> PendingFilterKind {
+        self.kind
+    }
+
+    pub(crate) fn filter_id(&self) -> u64 {
+        self.filter.id
+    }
+
+    pub(crate) fn bind(mut self, source: &RuntimeFilterSource) -> Self {
+        self.filter = self.filter.subscribe(source);
+        self
+    }
+
+    fn evaluate_in(
+        &self,
+        filter: &RuntimeFilter,
+        values: &BTreeMap<u64, ScalarValue>,
+        batch: &RecordBatch,
+    ) -> Result<ColumnarValue> {
+        if let Some(exact) = self.exact.get() {
+            return exact.evaluate(batch);
+        }
+        let key = || self.key.clone();
+        let exact: Arc<dyn PhysicalExpr> = if values.is_empty() {
+            if filter.has_null {
+                Arc::new(IsNullExpr::new(key()))
+            } else {
+                lit(false)
+            }
+        } else {
+            let in_list = Arc::new(InListExpr::try_new(
+                key(),
+                values.values().cloned().map(lit).collect(),
+                false,
+                batch.schema_ref(),
+            )?);
+            if filter.has_null {
+                Arc::new(BinaryExpr::new(
+                    in_list,
+                    Operator::Or,
+                    Arc::new(IsNullExpr::new(key())),
+                ))
+            } else {
+                in_list
+            }
+        };
+        self.exact.get_or_init(|| exact).evaluate(batch)
+    }
+}
+
+impl std::hash::Hash for PendingRuntimeFilterExpr {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.filter.id.hash(state);
+        self.kind.hash(state);
+        self.key.hash(state);
+    }
+}
+
+impl Eq for PendingRuntimeFilterExpr {}
+
+impl PartialEq for PendingRuntimeFilterExpr {
+    fn eq(&self, other: &Self) -> bool {
+        self.key.eq(&other.key)
+            && self.filter.id == other.filter.id
+            && self.kind == other.kind
+    }
+}
+
+impl fmt::Display for PendingRuntimeFilterExpr {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        let name = match self.kind {
+            PendingFilterKind::In => "runtime_pending_in",
+            PendingFilterKind::Bloom => "runtime_pending_bloom",
+        };
+        write!(f, "{name}({}, {})", self.filter.id, self.key)
+    }
+}
+
+impl fmt::Debug for PendingRuntimeFilterExpr {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(self, f)
+    }
+}
+
+impl PhysicalExpr for PendingRuntimeFilterExpr {
+    fn fmt_sql(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(self, f)
+    }
+
+    fn data_type(&self, _: &Schema) -> Result<DataType> {
+        Ok(DataType::Boolean)
+    }
+
+    fn nullable(&self, _: &Schema) -> Result<bool> {
+        Ok(self.kind == PendingFilterKind::In)
+    }
+
+    fn evaluate(&self, batch: &RecordBatch) -> Result<ColumnarValue> {
+        let passthrough =
+            |_: &RecordBatch| ColumnarValue::Scalar(ScalarValue::Boolean(Some(true)));
+        self.filter
+            .apply_or_pass(batch, passthrough, |batch, filter| {
+                match (self.kind, &filter.in_values) {
+                    (PendingFilterKind::In, Some(values)) => {
+                        self.evaluate_in(filter, values, batch)
+                    }
+                    (PendingFilterKind::Bloom, None) => {
+                        let keys =
+                            self.key.evaluate(batch)?.into_array(batch.num_rows())?;
+                        let keep = probe_mask(&keys, |hash, is_null| {
+                            if is_null {
+                                filter.has_null
+                            } else {
+                                bloom_contains(&filter.bloom, hash)
+                            }
+                        })?;
+                        Ok(ColumnarValue::Array(Arc::new(keep)))
+                    }
+                    _ => Ok(passthrough(batch)),
+                }
+            })
+    }
+
+    fn children(&self) -> Vec<&Arc<dyn PhysicalExpr>> {
+        vec![&self.key]
+    }
+
+    fn with_new_children(
+        self: Arc<Self>,
+        mut children: Vec<Arc<dyn PhysicalExpr>>,
+    ) -> Result<Arc<dyn PhysicalExpr>> {
+        Ok(Arc::new(Self {
+            key: children.remove(0),
+            kind: self.kind,
+            exact: OnceLock::new(),
+            filter: self.filter.clone(),
+        }))
+    }
+}
+
 /// Harvest only complete build taps from the actually executed task plan.
 pub fn collect_reports(
     plan: &Arc<dyn ExecutionPlan>,
@@ -741,6 +1046,7 @@ mod tests {
     use datafusion_proto::physical_plan::{
         DefaultPhysicalProtoConverter, PhysicalExtensionCodec,
     };
+    use futures::FutureExt;
     use prost::Message;
 
     fn input(partitions: Vec<Vec<Option<&str>>>) -> Arc<dyn ExecutionPlan> {
@@ -778,6 +1084,75 @@ mod tests {
                 &DefaultPhysicalProtoConverter {},
             )
             .unwrap()
+    }
+
+    #[tokio::test]
+    async fn runtime_filter_arrives_between_batches() {
+        let (send, receive) = tokio::sync::oneshot::channel();
+        let receive = Mutex::new(Some(receive));
+        let source = RuntimeFilterSource::new(move |_| {
+            let receive = receive.lock().take().unwrap();
+            async move { receive.await.ok() }.boxed()
+        });
+        let ctx = SessionContext::new_with_config(
+            datafusion::prelude::SessionConfig::new().with_extension(Arc::new(source)),
+        )
+        .task_ctx();
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "key",
+            DataType::Utf8View,
+            false,
+        )]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(StringViewArray::from(vec!["a", "b"]))],
+        )
+        .unwrap();
+        let scan =
+            MemorySourceConfig::try_new_exec(&[vec![batch.clone(), batch]], schema, None)
+                .unwrap();
+        let probe = RuntimeFilterApplyExec::try_new(
+            scan,
+            7,
+            Arc::new(Column::new("key", 0)),
+            None,
+        )
+        .unwrap();
+        let source = ctx
+            .session_config()
+            .get_extension::<RuntimeFilterSource>()
+            .unwrap();
+        let mut stream = probe.execute(0, ctx).unwrap();
+        let mut publication = source.subscribe(7).result.clone();
+        let first = stream
+            .next()
+            .now_or_never()
+            .expect("probe must start without the filter")
+            .unwrap()
+            .unwrap();
+        assert_eq!(first.num_rows(), 2);
+
+        let mut filter = RuntimeFilter::default();
+        let keys =
+            std::iter::once("b".to_owned()).chain((0..MAX_VALUES).map(|i| i.to_string()));
+        filter
+            .update(&(Arc::new(StringViewArray::from_iter_values(keys)) as ArrayRef))
+            .unwrap();
+        assert!(filter.in_hashes.is_none());
+        send.send(filter.to_proto(7).unwrap()).unwrap();
+        publication.changed().await.unwrap();
+
+        let second = stream.try_next().await.unwrap().unwrap();
+        assert_eq!(second.num_rows(), 1);
+        assert_eq!(
+            second
+                .column(0)
+                .as_any()
+                .downcast_ref::<StringViewArray>()
+                .unwrap()
+                .value(0),
+            "b"
+        );
     }
 
     #[tokio::test]
@@ -883,6 +1258,131 @@ mod tests {
             Ok(())
         })
         .unwrap();
+    }
+
+    #[tokio::test]
+    async fn late_filter_reaches_running_parquet_scan() {
+        use datafusion::datasource::listing::PartitionedFile;
+        use datafusion::datasource::physical_plan::{
+            FileScanConfigBuilder, ParquetSource,
+        };
+        use datafusion::datasource::source::DataSourceExec;
+        use datafusion::execution::object_store::ObjectStoreUrl;
+        use datafusion::parquet::arrow::ArrowWriter;
+        use datafusion::parquet::file::properties::WriterProperties;
+        use datafusion::physical_expr::utils::conjunction;
+        use datafusion_proto::physical_plan::AsExecutionPlan;
+        use datafusion_proto::protobuf::PhysicalPlanNode;
+
+        // Both representations must bypass the first batch and then filter
+        // rows read later by the same already-running scan.
+        for distinct_keys in [1, MAX_VALUES + 1] {
+            let mut filter = RuntimeFilter::default();
+            let build: ArrayRef = Arc::new(Int64Array::from_iter(
+                (0..distinct_keys as i64).map(Some).chain([None]),
+            ));
+            filter.update(&build).unwrap();
+            let candidates: ArrayRef =
+                Arc::new(Int64Array::from_iter_values(10_000..10_100));
+            let absent =
+                probe_mask(&candidates, |hash, is_null| filter.contains(hash, is_null))
+                    .unwrap()
+                    .iter()
+                    .position(|keep| keep == Some(false))
+                    .map(|index| 10_000 + index as i64)
+                    .unwrap();
+            let schema =
+                Arc::new(Schema::new(vec![Field::new("key", DataType::Int64, true)]));
+            let batch = RecordBatch::try_new(
+                schema.clone(),
+                vec![Arc::new(Int64Array::from(vec![
+                    Some(0),
+                    Some(absent),
+                    None,
+                ]))],
+            )
+            .unwrap();
+            let file = tempfile::NamedTempFile::new().unwrap();
+            let props = WriterProperties::builder()
+                .set_max_row_group_row_count(Some(3))
+                .build();
+            let mut writer =
+                ArrowWriter::try_new(file.reopen().unwrap(), schema.clone(), Some(props))
+                    .unwrap();
+            writer.write(&batch).unwrap();
+            writer.write(&batch).unwrap();
+            writer.close().unwrap();
+
+            let (send, receive) = tokio::sync::oneshot::channel();
+            let receive = Mutex::new(Some(receive));
+            let source = Arc::new(RuntimeFilterSource::new(move |filter_id| {
+                assert_eq!(filter_id, 19);
+                let receive = receive
+                    .lock()
+                    .take()
+                    .expect("one subscription for both slots");
+                async move { receive.await.ok() }.boxed()
+            }));
+            let ctx = SessionContext::new_with_config(
+                datafusion::prelude::SessionConfig::new()
+                    .with_batch_size(3)
+                    .with_extension(source.clone()),
+            )
+            .task_ctx();
+            let key = Arc::new(Column::new("key", 0));
+            let slots = [PendingFilterKind::In, PendingFilterKind::Bloom].map(|kind| {
+                Arc::new(PendingRuntimeFilterExpr::new(key.clone(), 19, kind))
+                    as Arc<dyn PhysicalExpr>
+            });
+            let parquet = ParquetSource::new(schema)
+                .with_predicate(conjunction(slots))
+                .with_pushdown_filters(true)
+                .with_reorder_filters(false);
+            let scan = FileScanConfigBuilder::new(
+                ObjectStoreUrl::local_filesystem(),
+                Arc::new(parquet),
+            )
+            .with_file(PartitionedFile::new(
+                file.path().to_string_lossy(),
+                file.as_file().metadata().unwrap().len(),
+            ))
+            .with_batch_size(Some(3))
+            .build();
+            let plan = DataSourceExec::from_data_source(scan);
+            let codec = BallistaPhysicalExtensionCodec::default();
+            let proto = PhysicalPlanNode::try_from_physical_plan(plan, &codec).unwrap();
+            let decoded = PhysicalPlanNode::decode(proto.encode_to_vec().as_slice())
+                .unwrap()
+                .try_into_physical_plan(&ctx, &codec)
+                .unwrap();
+            let mut stream = decoded.execute(0, ctx).unwrap();
+            let mut publication = source.subscribe(19).result.clone();
+            let first = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                stream.try_next(),
+            )
+            .await
+            .expect("scan must start before publication")
+            .unwrap()
+            .unwrap();
+            assert_eq!(first, batch);
+            send.send(filter.to_proto(19).unwrap()).unwrap();
+            publication.changed().await.unwrap();
+
+            let remaining = collect_stream(stream).await.unwrap();
+            let keys: Vec<_> = remaining
+                .iter()
+                .flat_map(|batch| {
+                    batch
+                        .column(0)
+                        .as_any()
+                        .downcast_ref::<Int64Array>()
+                        .unwrap()
+                        .iter()
+                })
+                .collect();
+            assert_eq!(keys, [Some(0), None]);
+        }
     }
 
     #[test]

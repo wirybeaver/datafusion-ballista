@@ -26,13 +26,14 @@ use ballista_core::serde::protobuf::{
     CleanJobDataResult, CreateUpdateSessionParams, CreateUpdateSessionResult,
     ExecuteQueryFailureResult, ExecuteQueryParams, ExecuteQueryResult,
     ExecuteQuerySuccessResult, ExecutorHeartbeat, ExecutorRegistration,
-    ExecutorStoppedParams, ExecutorStoppedResult, FailedTask, GetJobMetricsParams,
-    GetJobMetricsResult, GetJobStatusParams, GetJobStatusResult, HeartBeatParams,
-    HeartBeatResult, JobStatus, KeyValuePair, PollWorkParams, PollWorkResult,
-    RegisterExecutorParams, RegisterExecutorResult, RemoveSessionParams,
-    RemoveSessionResult, TaskDefinition, TaskStatus, UpdateTaskStatusParams,
-    UpdateTaskStatusResult, execute_query_failure_result, execute_query_result,
-    executor_metric::Metric, task_status,
+    ExecutorStoppedParams, ExecutorStoppedResult, FailedTask, FetchRuntimeFilterParams,
+    FetchRuntimeFilterResult, GetJobMetricsParams, GetJobMetricsResult,
+    GetJobStatusParams, GetJobStatusResult, HeartBeatParams, HeartBeatResult, JobStatus,
+    KeyValuePair, PollWorkParams, PollWorkResult, RegisterExecutorParams,
+    RegisterExecutorResult, RemoveSessionParams, RemoveSessionResult, TaskDefinition,
+    TaskStatus, UpdateTaskStatusParams, UpdateTaskStatusResult,
+    execute_query_failure_result, execute_query_result, executor_metric::Metric,
+    task_status,
 };
 use ballista_core::serde::scheduler::ExecutorMetadata;
 use ballista_core::version;
@@ -623,6 +624,35 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> SchedulerGrpc
                 Err(Status::internal(msg))
             }
         }
+    }
+
+    async fn fetch_runtime_filter(
+        &self,
+        request: Request<FetchRuntimeFilterParams>,
+    ) -> Result<Response<FetchRuntimeFilterResult>, Status> {
+        let request = request.into_inner();
+        let subscription = match self
+            .state
+            .task_manager
+            .get_active_execution_graph(&request.job_id.into())
+        {
+            Some(graph) => graph
+                .write()
+                .await
+                .subscribe_runtime_filter(request.filter_id)
+                .map_err(|err| Status::internal(err.to_string()))?,
+            None => None,
+        };
+        let payload = if let Some(mut subscription) = subscription {
+            subscription
+                .wait_for(Option::is_some)
+                .await
+                .ok()
+                .and_then(|value| value.clone())
+        } else {
+            None
+        };
+        Ok(Response::new(FetchRuntimeFilterResult { payload }))
     }
 
     async fn get_job_metrics(

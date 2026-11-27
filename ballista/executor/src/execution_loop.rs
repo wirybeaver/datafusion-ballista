@@ -27,11 +27,12 @@ use crate::executor_process::remove_job_data;
 use crate::{TaskCompletionExtras, TaskExecutionTimes, as_task_status};
 use ballista_core::JobId;
 use ballista_core::error::BallistaError;
-use ballista_core::extension::SessionConfigHelperExt;
+use ballista_core::execution_plans::runtime_filter::RuntimeFilterSource;
+use ballista_core::extension::{SessionConfigExt, SessionConfigHelperExt};
 use ballista_core::serde::BallistaCodec;
 use ballista_core::serde::protobuf::{
-    PollWorkParams, PollWorkResult, TaskDefinition, TaskStatus,
-    scheduler_grpc_client::SchedulerGrpcClient,
+    FetchRuntimeFilterParams, PollWorkParams, PollWorkResult, RuntimeFilterPayload,
+    TaskDefinition, TaskStatus, scheduler_grpc_client::SchedulerGrpcClient,
 };
 use ballista_core::serde::scheduler::{ExecutorSpecification, TaskKey};
 use ballista_core::utils::redact_key_value_pairs;
@@ -118,7 +119,8 @@ pub async fn poll_loop<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan,
     health: crate::health::ExecutorHealth,
 ) -> Result<(), BallistaError>
 where
-    C: tonic::client::GrpcService<tonic::body::Body>,
+    C: tonic::client::GrpcService<tonic::body::Body> + Clone + Send + Sync + 'static,
+    C::Future: Send,
     C::Error: Into<StdError>,
     C::ResponseBody: Body<Data = Bytes> + Send + 'static,
     <C::ResponseBody as Body>::Error: Into<StdError> + Send,
@@ -240,6 +242,7 @@ where
                         task.clone(),
                         &codec,
                         &dedicated_executor,
+                        scheduler.clone(),
                     )
                     .await
                     {
@@ -348,14 +351,48 @@ pub(crate) fn any_to_string(any: &Box<dyn Any + Send>) -> String {
     }
 }
 
-async fn run_received_task<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan>(
+pub(crate) async fn fetch_runtime_filter<C>(
+    mut scheduler: SchedulerGrpcClient<C>,
+    job_id: JobId,
+    filter_id: u64,
+) -> Option<RuntimeFilterPayload>
+where
+    C: tonic::client::GrpcService<tonic::body::Body>,
+    C::Error: Into<StdError>,
+    C::ResponseBody: Body<Data = Bytes> + Send + 'static,
+    <C::ResponseBody as Body>::Error: Into<StdError> + Send,
+{
+    match scheduler
+        .fetch_runtime_filter(FetchRuntimeFilterParams {
+            job_id: job_id.clone().into(),
+            filter_id,
+        })
+        .await
+    {
+        Ok(response) => response.into_inner().payload,
+        Err(error) => {
+            debug!("Runtime filter {job_id}/{filter_id} unavailable: {error}");
+            None
+        }
+    }
+}
+
+async fn run_received_task<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan, C>(
     executor: Arc<Executor>,
     permit: OwnedSemaphorePermit,
     task_status_sender: Sender<TaskStatus>,
     task: TaskDefinition,
     codec: &BallistaCodec<T, U>,
     dedicated_executor: &DedicatedExecutor,
-) -> Result<(), BallistaError> {
+    scheduler: SchedulerGrpcClient<C>,
+) -> Result<(), BallistaError>
+where
+    C: tonic::client::GrpcService<tonic::body::Body> + Clone + Send + Sync + 'static,
+    C::Future: Send,
+    C::Error: Into<StdError>,
+    C::ResponseBody: Body<Data = Bytes> + Send + 'static,
+    <C::ResponseBody as Body>::Error: Into<StdError> + Send,
+{
     let task_id = task.task_id;
     let task_attempt_num = task.task_attempt_num;
     let job_id: JobId = task.job_id.into();
@@ -377,7 +414,14 @@ async fn run_received_task<T: 'static + AsLogicalPlan, U: 'static + AsExecutionP
         redact_key_value_pairs(&task.props)
     );
     let session_config = executor.produce_config();
-    let session_config = session_config.update_from_key_value_pair(&task.props);
+    let mut session_config = session_config.update_from_key_value_pair(&task.props);
+    if session_config.ballista_config().runtime_filter_enabled() {
+        let job_id = job_id.clone();
+        let source = RuntimeFilterSource::new(move |id| {
+            fetch_runtime_filter(scheduler.clone(), job_id.clone(), id).boxed()
+        });
+        session_config = session_config.with_extension(Arc::new(source));
+    }
 
     let task_scalar_functions = executor.function_registry.scalar_functions.clone();
     let task_aggregate_functions = executor.function_registry.aggregate_functions.clone();
@@ -707,6 +751,16 @@ mod tests {
             _: Request<GetJobStatusParams>,
         ) -> GrpcResult<GetJobStatusResult> {
             not_called()
+        }
+
+        async fn fetch_runtime_filter(
+            &self,
+            _: tonic::Request<ballista_core::serde::protobuf::FetchRuntimeFilterParams>,
+        ) -> std::result::Result<
+            tonic::Response<ballista_core::serde::protobuf::FetchRuntimeFilterResult>,
+            tonic::Status,
+        > {
+            Err(tonic::Status::unimplemented("fetch_runtime_filter"))
         }
 
         async fn get_job_metrics(
