@@ -29,6 +29,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
 
+use futures::FutureExt;
 use log::{debug, error, info, warn};
 use tonic::transport::Channel;
 use tonic::transport::server::TcpIncoming;
@@ -36,6 +37,7 @@ use tonic::{Request, Response, Status};
 
 use ballista_core::error::BallistaError;
 use ballista_core::execution_plans::PipelinedShuffleWriterExec;
+use ballista_core::execution_plans::runtime_filter::RuntimeFilterSource;
 use ballista_core::extension::EndpointOverrideFn;
 use ballista_core::serde::BallistaCodec;
 use ballista_core::serde::protobuf::{
@@ -64,6 +66,7 @@ use tokio::sync::mpsc::error::TryRecvError;
 use tokio::task::JoinHandle;
 
 use crate::cpu_bound_executor::DedicatedExecutor;
+use crate::execution_loop::fetch_runtime_filter;
 use crate::executor::Executor;
 use crate::executor_process::{ExecutorProcessConfig, remove_job_data};
 use crate::health::ExecutorHealth;
@@ -399,6 +402,29 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> ExecutorServer<T,
         self.health.mark_heartbeat_failed();
         false
     }
+    // Decode-time Parquet predicates and execution-time Apply operators share
+    // the same lazy source, including tasks sharing one decoded multi-task plan.
+    fn config_for_delivery(
+        &self,
+        endpoint: &str,
+        job: &str,
+    ) -> datafusion::prelude::SessionConfig {
+        let server = self.clone();
+        let endpoint = endpoint.to_owned();
+        let job = ballista_core::JobId::from(job.to_owned());
+        let source = RuntimeFilterSource::new(move |id| {
+            let (server, endpoint, job) = (server.clone(), endpoint.clone(), job.clone());
+            async move {
+                let scheduler = server.get_scheduler_client(&endpoint).await.ok()?;
+                fetch_runtime_filter(scheduler, job, id).await
+            }
+            .boxed()
+        });
+        self.executor
+            .produce_config()
+            .with_extension(Arc::new(source))
+    }
+
     /// This method should not return Err. If task fails, a failure task status should be sent
     /// to the channel to notify the scheduler.
     async fn run_task(&self, task_identity: String, curator_task: CuratorTaskDefinition) {
@@ -793,13 +819,14 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> ExecutorGrpc
         } = request.into_inner();
         let task_sender = self.executor_env.tx_task.clone();
         for task in tasks {
+            let config = self.config_for_delivery(&scheduler_endpoint, &task.job_id);
             task_sender
                 .send(CuratorTaskDefinition {
                     scheduler_endpoint: scheduler_endpoint.clone(),
                     task: get_task_definition(
                         task,
                         self.executor.runtime_producer.clone(),
-                        self.executor.produce_config(),
+                        config,
                         self.executor.function_registry.scalar_functions.clone(),
                         self.executor.function_registry.aggregate_functions.clone(),
                         self.executor.function_registry.window_functions.clone(),
@@ -834,7 +861,7 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> ExecutorGrpc
             let multi_task: Vec<TaskDefinition> = match get_task_definition_vec(
                 multi_task,
                 self.executor.runtime_producer.clone(),
-                self.executor.produce_config(),
+                self.config_for_delivery(&scheduler_endpoint, &job_id),
                 self.executor.function_registry.scalar_functions.clone(),
                 self.executor.function_registry.aggregate_functions.clone(),
                 self.executor.function_registry.window_functions.clone(),

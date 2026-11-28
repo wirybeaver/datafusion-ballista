@@ -1596,6 +1596,16 @@ mod test {
             not_called()
         }
 
+        async fn fetch_runtime_filter(
+            &self,
+            _: tonic::Request<crate::serde::protobuf::FetchRuntimeFilterParams>,
+        ) -> std::result::Result<
+            tonic::Response<crate::serde::protobuf::FetchRuntimeFilterResult>,
+            tonic::Status,
+        > {
+            Err(tonic::Status::unimplemented("fetch_runtime_filter"))
+        }
+
         async fn get_job_metrics(
             &self,
             _: Request<GetJobMetricsParams>,

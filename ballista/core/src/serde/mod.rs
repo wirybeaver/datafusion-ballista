@@ -58,7 +58,10 @@ use std::marker::PhantomData;
 use std::sync::Arc;
 use std::{convert::TryInto, io::Cursor};
 
-use crate::execution_plans::runtime_filter::RuntimeFilterBloomExpr;
+use crate::execution_plans::runtime_filter::{
+    PendingFilterKind, PendingRuntimeFilterExpr, RuntimeFilterBloomExpr,
+    RuntimeFilterSource,
+};
 use crate::execution_plans::sort_shuffle::{ShuffleRouting, SortShuffleConfig};
 use crate::execution_plans::{
     BufferExec, BufferMode, ChaosExec, CoalescePlan, FinalizedPartitionState, InputOrder,
@@ -620,18 +623,50 @@ fn scalar_to_proto(
     })
 }
 
+// Zero is not a valid protobuf field tag, so pending predicates are distinct
+// from existing serialized RuntimeFilterPayloads.
+const PENDING_RUNTIME_FILTER_TAG: u8 = 0;
+
+#[derive(prost::Message)]
+struct PendingRuntimeFilterProto {
+    #[prost(uint64, tag = "1")]
+    filter_id: u64,
+    #[prost(bool, tag = "2")]
+    exact: bool,
+}
+
 impl PhysicalExtensionCodec for BallistaPhysicalExtensionCodec {
     fn try_decode_expr(
         &self,
         buf: &[u8],
         inputs: &[Arc<dyn PhysicalExpr>],
-        _ctx: &PhysicalExprDecodeCtx<'_>,
+        ctx: &PhysicalExprDecodeCtx<'_>,
     ) -> Result<Arc<dyn PhysicalExpr>> {
         let [key] = inputs else {
             return datafusion::common::internal_err!(
-                "Runtime Bloom predicate expects one key"
+                "Runtime filter predicate expects one key"
             );
         };
+        if let Some(buf) = buf.strip_prefix(&[PENDING_RUNTIME_FILTER_TAG]) {
+            let pending = PendingRuntimeFilterProto::decode(buf).map_err(|error| {
+                DataFusionError::Internal(format!(
+                    "Could not decode pending runtime filter predicate: {error}"
+                ))
+            })?;
+            let kind = if pending.exact {
+                PendingFilterKind::In
+            } else {
+                PendingFilterKind::Bloom
+            };
+            let mut predicate =
+                PendingRuntimeFilterExpr::new(key.clone(), pending.filter_id, kind);
+            if let Some(source) = ctx.session::<TaskContext>().and_then(|task| {
+                task.session_config().get_extension::<RuntimeFilterSource>()
+            }) {
+                predicate = predicate.bind(&source);
+            }
+            return Ok(Arc::new(predicate));
+        }
         let payload = protobuf::RuntimeFilterPayload::decode(buf).map_err(|error| {
             DataFusionError::Internal(format!(
                 "Could not decode runtime Bloom predicate: {error}"
@@ -649,12 +684,21 @@ impl PhysicalExtensionCodec for BallistaPhysicalExtensionCodec {
         buf: &mut Vec<u8>,
         ctx: &PhysicalExprEncodeCtx<'_>,
     ) -> Result<()> {
-        let Some(bloom) = node.downcast_ref::<RuntimeFilterBloomExpr>() else {
+        let encoded = if let Some(bloom) = node.downcast_ref::<RuntimeFilterBloomExpr>() {
+            bloom.payload().encode(buf)
+        } else if let Some(pending) = node.downcast_ref::<PendingRuntimeFilterExpr>() {
+            buf.push(PENDING_RUNTIME_FILTER_TAG);
+            PendingRuntimeFilterProto {
+                filter_id: pending.filter_id(),
+                exact: pending.kind() == PendingFilterKind::In,
+            }
+            .encode(buf)
+        } else {
             return self.default_codec.try_encode_expr(node, buf, ctx);
         };
-        bloom.payload().encode(buf).map_err(|error| {
+        encoded.map_err(|error| {
             DataFusionError::Internal(format!(
-                "Could not encode runtime Bloom predicate: {error}"
+                "Could not encode runtime filter predicate: {error}"
             ))
         })
     }

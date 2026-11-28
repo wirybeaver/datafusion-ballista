@@ -24,7 +24,9 @@ use super::runtime_filter_planner::ProbeBinding;
 use crate::physical_optimizer::filter_pushdown::FilterPushdown;
 use crate::state::execution_stage::ExecutionStage;
 use ballista_core::execution_plans::runtime_filter::RuntimeFilter;
-use ballista_core::execution_plans::runtime_filter::RuntimeFilterBloomExpr;
+use ballista_core::execution_plans::runtime_filter::{
+    PendingFilterKind, PendingRuntimeFilterExpr, RuntimeFilterBloomExpr,
+};
 use ballista_core::execution_plans::{RuntimeFilterApplyExec, RuntimeFilterBuildExec};
 use ballista_core::extension::SessionConfigExt;
 use ballista_core::serde::protobuf::{RuntimeFilterPayload, task_status};
@@ -41,10 +43,12 @@ use datafusion::physical_plan::filter_pushdown::PushedDown;
 use datafusion::prelude::SessionConfig;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use tokio::sync::watch;
 
 #[derive(Debug, Clone, Default)]
 pub(super) struct RuntimeFilterRegistry {
     producers: HashMap<u64, usize>,
+    pending: HashMap<u64, watch::Sender<Option<RuntimeFilterPayload>>>,
     // Consumed once before dispatch; retries keep the specialized plan.
     probes: HashMap<usize, Vec<ProbeBinding>>,
 }
@@ -115,13 +119,17 @@ impl RuntimeFilterRegistry {
                     .iter()
                     .filter(|probe| probe.scan_index == scan_index)
                 {
-                    let Some(payload) = completed_filter(
-                        binding.filter_id,
-                        self.producers
-                            .get(&binding.filter_id)
-                            .and_then(|id| stages.get(id)),
-                    )?
-                    else {
+                    let id = binding.filter_id;
+                    let producer =
+                        self.producers.get(&id).and_then(|stage| stages.get(stage));
+                    let payload = if producer.is_none_or(producer_pending) {
+                        self.pending
+                            .entry(id)
+                            .or_insert_with(|| watch::channel(None).0);
+                        None
+                    } else if let Some(payload) = completed_filter(id, producer)? {
+                        Some(payload)
+                    } else {
                         continue;
                     };
                     let key: Arc<dyn PhysicalExpr> =
@@ -130,19 +138,16 @@ impl RuntimeFilterRegistry {
                             binding.column,
                         ));
                     if let Some(reader) =
-                        push_into_parquet(&scan, &key, &payload, config)?
+                        push_into_parquet(&scan, &key, id, payload.as_ref(), config)?
                     {
                         scan = order_reader_predicates(reader, true, &mut probe_scans)?;
                     } else {
-                        fallback.push((key, payload));
+                        fallback.push((id, key, payload));
                     }
                 }
-                for (key, payload) in fallback {
+                for (id, key, payload) in fallback {
                     scan = Arc::new(RuntimeFilterApplyExec::try_new(
-                        scan,
-                        payload.filter_id,
-                        key,
-                        Some(payload),
+                        scan, id, key, payload,
                     )?);
                 }
                 Ok(if Arc::ptr_eq(&scan, &node) {
@@ -154,6 +159,58 @@ impl RuntimeFilterRegistry {
             .data;
         Ok(plan)
     }
+
+    pub(super) fn subscribe(
+        &mut self,
+        id: u64,
+        stages: &HashMap<usize, ExecutionStage>,
+    ) -> Result<Option<watch::Receiver<Option<RuntimeFilterPayload>>>> {
+        if let Some(sender) = self.pending.get(&id) {
+            return Ok(Some(sender.subscribe()));
+        }
+        let Some(stage) = self.producers.get(&id).and_then(|id| stages.get(id)) else {
+            return Ok(None);
+        };
+        if producer_pending(stage) {
+            return Ok(Some(
+                self.pending
+                    .entry(id)
+                    .or_insert_with(|| watch::channel(None).0)
+                    .subscribe(),
+            ));
+        }
+        Ok(completed_filter(id, Some(stage))?
+            .map(|payload| watch::channel(Some(payload)).1))
+    }
+
+    pub(super) fn publish(&mut self, stage_id: usize, stage: &ExecutionStage) {
+        self.pending.retain(|&id, sender| {
+            if self.producers.get(&id) != Some(&stage_id) {
+                return true;
+            }
+            if sender.receiver_count() == 0 {
+                return false;
+            }
+            match completed_filter(id, Some(stage)) {
+                Ok(Some(payload)) => {
+                    sender.send_replace(Some(payload));
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    log::warn!("Could not publish runtime filter {id}: {error}")
+                }
+            }
+            false
+        });
+    }
+}
+
+fn producer_pending(stage: &ExecutionStage) -> bool {
+    matches!(stage, ExecutionStage::Running(stage) if !stage.is_successful())
+        || matches!(
+            stage,
+            ExecutionStage::Resolved(_) | ExecutionStage::UnResolved(_)
+        )
 }
 
 fn leads_to_probe_scan(
@@ -174,7 +231,8 @@ fn leads_to_probe_scan(
 fn push_into_parquet(
     child: &Arc<dyn ExecutionPlan>,
     key: &Arc<dyn PhysicalExpr>,
-    payload: &RuntimeFilterPayload,
+    id: u64,
+    payload: Option<&RuntimeFilterPayload>,
     config: &SessionConfig,
 ) -> Result<Option<Arc<dyn ExecutionPlan>>> {
     let Some(exec) = child.downcast_ref::<DataSourceExec>() else {
@@ -205,9 +263,35 @@ fn push_into_parquet(
     }
     // Only this scan opts into decoding predicates. FileScanConfig handles key
     // remapping for projected scans and reports any unsupported predicates.
-    let Some(predicate) = probe_predicate(key, payload, child.schema().as_ref(), config)?
-    else {
-        return Ok(None);
+    let predicates = if let Some(payload) = payload {
+        let Some(predicate) =
+            probe_predicate(key, payload, child.schema().as_ref(), config)?
+        else {
+            return Ok(None);
+        };
+        vec![predicate]
+    } else {
+        // Install both positions before the scan. A single subscription supplies
+        // the finished summary; only its matching representation evaluates keys.
+        let codec = config.ballista_physical_extension_codec();
+        let predicates: Vec<Arc<dyn PhysicalExpr>> =
+            [PendingFilterKind::In, PendingFilterKind::Bloom]
+                .into_iter()
+                .map(|kind| {
+                    Arc::new(PendingRuntimeFilterExpr::new(key.clone(), id, kind))
+                        as Arc<dyn PhysicalExpr>
+                })
+                .collect();
+        if predicates.iter().any(|expr| {
+            datafusion_proto::physical_plan::to_proto::serialize_physical_expr(
+                expr,
+                codec.as_ref(),
+            )
+            .is_err()
+        }) {
+            return Ok(None);
+        }
+        predicates
     };
     let mut files = files.clone();
     files.file_source = Arc::new(
@@ -216,9 +300,11 @@ fn push_into_parquet(
             .with_pushdown_filters(true)
             .with_reorder_filters(false),
     );
-    let result = files.try_pushdown_filters(vec![predicate], config.options())?;
+    let result = files.try_pushdown_filters(predicates, config.options())?;
     match (result.filters.as_slice(), result.updated_node) {
-        ([PushedDown::Yes], Some(source)) => {
+        (accepted, Some(source))
+            if accepted.iter().all(|f| matches!(f, PushedDown::Yes)) =>
+        {
             Ok(Some(Arc::new(exec.clone().with_data_source(source))))
         }
         _ => Ok(None),
@@ -299,15 +385,25 @@ fn order_reader_predicates(
         // ParquetSource appends the remapped runtime predicate to the scan's
         // existing conjunction. Give a new exact set first use of the rows.
         if added_runtime_predicate
-            && predicates
-                .last()
-                .is_some_and(|p| !p.is::<RuntimeFilterBloomExpr>())
+            && predicates.last().is_some_and(|p| {
+                !p.is::<RuntimeFilterBloomExpr>() && !p.is::<PendingRuntimeFilterExpr>()
+            })
         {
             predicates.rotate_right(1);
         }
         // Stable ordering keeps SQL predicates (including SQL IN lists) in
         // their original order and also handles a later ordinary pushdown.
-        predicates.sort_by_key(|p| p.is::<RuntimeFilterBloomExpr>());
+        predicates.sort_by_key(|p| {
+            match p
+                .downcast_ref::<PendingRuntimeFilterExpr>()
+                .map(|pending| pending.kind())
+            {
+                Some(PendingFilterKind::In) => 0,
+                Some(PendingFilterKind::Bloom) => 2,
+                None if p.is::<RuntimeFilterBloomExpr>() => 2,
+                None => 1,
+            }
+        });
         let mut seen = HashSet::new();
         let predicates = predicates
             .into_iter()
@@ -423,9 +519,15 @@ mod tests {
             .unwrap()
             .unwrap();
         for payload in [report(0..160).await, small] {
-            let reader = push_into_parquet(&scan, &key, &payload, &config)
-                .unwrap()
-                .unwrap();
+            let reader = push_into_parquet(
+                &scan,
+                &key,
+                payload.filter_id,
+                Some(&payload),
+                &config,
+            )
+            .unwrap()
+            .unwrap();
             scan = order_reader_predicates(reader, true, &mut vec![]).unwrap();
         }
         let exec = scan.downcast_ref::<DataSourceExec>().unwrap();
@@ -435,6 +537,62 @@ mod tests {
         assert_eq!(expressions.len(), 4);
         assert_eq!(&expressions[..3], [&expected_in, &range, &sql_in]);
         assert!(expressions[3].is::<RuntimeFilterBloomExpr>());
+    }
+
+    #[test]
+    fn dispatch_installs_pending_predicates_in_the_reader() {
+        use datafusion::datasource::physical_plan::FileScanConfigBuilder;
+        use datafusion::execution::object_store::ObjectStoreUrl;
+        let schema = source([]).schema();
+        let ordinary: Arc<dyn PhysicalExpr> = Arc::new(BinaryExpr::new(
+            Arc::new(Column::new("k", 0)),
+            datafusion::logical_expr::Operator::Gt,
+            lit(0_i64),
+        ));
+        let parquet = ParquetSource::new(schema).with_predicate(ordinary.clone());
+        let files = FileScanConfigBuilder::new(
+            ObjectStoreUrl::local_filesystem(),
+            Arc::new(parquet),
+        )
+        .build();
+        let scan: Arc<dyn ExecutionPlan> = DataSourceExec::from_data_source(files);
+        let mut hub = RuntimeFilterRegistry::default();
+        hub.register(
+            2,
+            scan.as_ref(),
+            vec![ProbeBinding {
+                scan_index: 0,
+                filter_id: 3,
+                column: 0,
+            }],
+        );
+        let prepared = hub
+            .prepare(2, scan, &HashMap::new(), &SessionConfig::new())
+            .unwrap();
+        let reader = prepared.downcast_ref::<DataSourceExec>().unwrap();
+        let files = reader
+            .data_source()
+            .downcast_ref::<FileScanConfig>()
+            .unwrap();
+        let predicate = files.file_source.filter().unwrap();
+        let predicates = split_conjunction(&predicate);
+        let [first, existing, last] = predicates.as_slice() else {
+            panic!("{predicate}");
+        };
+        assert_eq!(
+            first
+                .downcast_ref::<PendingRuntimeFilterExpr>()
+                .unwrap()
+                .kind(),
+            PendingFilterKind::In
+        );
+        assert_eq!(*existing, &ordinary);
+        assert_eq!(
+            last.downcast_ref::<PendingRuntimeFilterExpr>()
+                .unwrap()
+                .kind(),
+            PendingFilterKind::Bloom
+        );
     }
 
     fn task(
@@ -503,7 +661,9 @@ mod tests {
         let bypass = hub
             .prepare(2, probe.clone(), &stages, &Default::default())
             .unwrap();
-        assert!(Arc::ptr_eq(&bypass, &probe));
+        assert!(bypass.is::<RuntimeFilterApplyExec>());
+        let mut delivery = hub.subscribe(3, &stages).unwrap().unwrap();
+        assert!(!delivery.has_changed().unwrap());
         assert_eq!(keys(bypass.clone()).await, [1, 2, 3, 4]);
         let ExecutionStage::Running(stage) = stages.get_mut(&1).unwrap() else {
             unreachable!()
@@ -513,7 +673,19 @@ mod tests {
         stage.task_infos[1] = task(1, 1, Some(report([2]).await));
         stage.pending.next_slice(1);
         stage.task_infos.push(task(2, 0, Some(report([3]).await)));
-        // A stage already dispatched without a filter stays unchanged.
+        hub.publish(1, &stages[&1]);
+        let arrived = delivery
+            .wait_for(Option::is_some)
+            .await
+            .unwrap()
+            .clone()
+            .unwrap();
+        let apply = bypass.downcast_ref::<RuntimeFilterApplyExec>().unwrap();
+        assert_eq!(
+            keys(Arc::new(apply.with_payload(arrived).unwrap())).await,
+            [2, 3]
+        );
+        // The pending stage plan survives retries and can subscribe again.
         let frozen = hub
             .prepare(2, bypass, &stages, &Default::default())
             .unwrap();

@@ -162,6 +162,20 @@ pub trait ExecutionGraph: Debug {
         max_stage_failures: usize,
     ) -> Result<Vec<QueryStageSchedulerEvent>>;
 
+    /// Subscribe to a join filter for an executing task. Only AQE jobs publish filters.
+    fn subscribe_runtime_filter(
+        &mut self,
+        _filter_id: u64,
+    ) -> Result<
+        Option<
+            tokio::sync::watch::Receiver<
+                Option<ballista_core::serde::protobuf::RuntimeFilterPayload>,
+            >,
+        >,
+    > {
+        Ok(None)
+    }
+
     /// Returns all the currently running stage IDs.
     fn running_stages(&self) -> Vec<usize>;
 

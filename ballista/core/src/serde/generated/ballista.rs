@@ -2190,6 +2190,20 @@ pub struct RunningTaskInfo {
     pub stage_id: u32,
 }
 #[allow(clippy::all)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct FetchRuntimeFilterParams {
+    #[prost(string, tag = "1")]
+    pub job_id: ::prost::alloc::string::String,
+    #[prost(uint64, tag = "2")]
+    pub filter_id: u64,
+}
+#[allow(clippy::all)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct FetchRuntimeFilterResult {
+    #[prost(message, optional, tag = "1")]
+    pub payload: ::core::option::Option<RuntimeFilterPayload>,
+}
+#[allow(clippy::all)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
 #[repr(i32)]
 pub enum BufferMode {
@@ -2708,6 +2722,36 @@ pub mod scheduler_grpc_client {
                 );
             self.inner.unary(req, path, codec).await
         }
+        /// Executors may request a pending filter without blocking task execution.
+        pub async fn fetch_runtime_filter(
+            &mut self,
+            request: impl tonic::IntoRequest<super::FetchRuntimeFilterParams>,
+        ) -> std::result::Result<
+            tonic::Response<super::FetchRuntimeFilterResult>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/ballista.protobuf.SchedulerGrpc/FetchRuntimeFilter",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(
+                    GrpcMethod::new(
+                        "ballista.protobuf.SchedulerGrpc",
+                        "FetchRuntimeFilter",
+                    ),
+                );
+            self.inner.unary(req, path, codec).await
+        }
         /// Used by Executor to tell Scheduler it is stopped.
         pub async fn executor_stopped(
             &mut self,
@@ -2871,6 +2915,14 @@ pub mod scheduler_grpc_server {
             request: tonic::Request<super::GetJobMetricsParams>,
         ) -> std::result::Result<
             tonic::Response<super::GetJobMetricsResult>,
+            tonic::Status,
+        >;
+        /// Executors may request a pending filter without blocking task execution.
+        async fn fetch_runtime_filter(
+            &self,
+            request: tonic::Request<super::FetchRuntimeFilterParams>,
+        ) -> std::result::Result<
+            tonic::Response<super::FetchRuntimeFilterResult>,
             tonic::Status,
         >;
         /// Used by Executor to tell Scheduler it is stopped.
@@ -3413,6 +3465,52 @@ pub mod scheduler_grpc_server {
                     let inner = self.inner.clone();
                     let fut = async move {
                         let method = GetJobMetricsSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/ballista.protobuf.SchedulerGrpc/FetchRuntimeFilter" => {
+                    #[allow(non_camel_case_types)]
+                    struct FetchRuntimeFilterSvc<T: SchedulerGrpc>(pub Arc<T>);
+                    impl<
+                        T: SchedulerGrpc,
+                    > tonic::server::UnaryService<super::FetchRuntimeFilterParams>
+                    for FetchRuntimeFilterSvc<T> {
+                        type Response = super::FetchRuntimeFilterResult;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::FetchRuntimeFilterParams>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as SchedulerGrpc>::fetch_runtime_filter(&inner, request)
+                                    .await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = FetchRuntimeFilterSvc(inner);
                         let codec = tonic_prost::ProstCodec::default();
                         let mut grpc = tonic::server::Grpc::new(codec)
                             .apply_compression_config(
