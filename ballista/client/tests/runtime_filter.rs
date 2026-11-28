@@ -115,9 +115,10 @@ async fn distributed_runtime_filter_matches_unfiltered_joins() {
         }),
         "runtime filter must actually prune rows: {plan}"
     );
-    // Independently runnable partitioned stages must preserve results even
-    // when the producer has not reported before the probe is dispatched.
+    // Opt into waiting for independently runnable partitioned stages and
+    // require complete producer coverage before probe dispatch.
     for setting in [
+        "ballista.planner.runtime_filter.wait_timeout_ms = 5000",
         "ballista.optimizer.broadcast_join_threshold_bytes = 0",
         "ballista.optimizer.broadcast_join_threshold_rows = 0",
         "ballista.optimizer.stage_build_side = false",
@@ -127,6 +128,7 @@ async fn distributed_runtime_filter_matches_unfiltered_joins() {
     let partitioned = run(&ctx, queries[0]).await;
     let plan = run(&ctx, &format!("EXPLAIN ANALYZE {}", queries[0])).await;
     assert!(plan.contains("mode=Partitioned"), "{plan}");
+    assert!(plan.contains("ready=true"), "{plan}");
     run(&ctx, "SET ballista.planner.runtime_filter.enabled = false").await;
     assert_eq!(partitioned, run(&ctx, queries[0]).await);
 }

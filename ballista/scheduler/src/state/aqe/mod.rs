@@ -282,8 +282,12 @@ impl AdaptiveExecutionGraph {
             .get::<ballista_core::config::BallistaConfig>();
         let runtime_filters = filter_config
             .filter(|config| config.runtime_filter_enabled())
-            .map(|_| {
-                let mut registry = runtime_filter::RuntimeFilterRegistry::default();
+            .map(|config| {
+                let mut registry = runtime_filter::RuntimeFilterRegistry::new(
+                    std::time::Duration::from_millis(
+                        config.runtime_filter_wait_timeout_ms() as u64,
+                    ),
+                );
                 for (&id, stage) in &stages {
                     registry.register(id, stage.plan());
                 }
@@ -689,47 +693,50 @@ impl AdaptiveExecutionGraph {
         }
     }
 
-    fn find_running_stage_id(&self, black_list: &[usize]) -> Option<usize> {
-        self.stages.iter().find_map(|(stage_id, stage)| {
-            if black_list.contains(stage_id) {
-                None
-            } else if let ExecutionStage::Running(stage) = stage {
-                if stage.available_tasks() > 0 {
-                    Some(*stage_id)
-                } else {
-                    None
-                }
-            } else {
-                None
+    fn find_running_stage_id(&mut self, black_list: &[usize]) -> Option<usize> {
+        let mut candidates = self.stages.iter().filter_map(|(&id, stage)| match stage {
+            ExecutionStage::Running(stage)
+                if !black_list.contains(&id) && stage.available_tasks() > 0 =>
+            {
+                Some(id)
             }
-        })
+            _ => None,
+        });
+        if self.runtime_filters.is_none() {
+            return candidates.next();
+        }
+        let candidates = candidates.collect::<Vec<_>>();
+        let now = tokio::time::Instant::now();
+        candidates
+            .into_iter()
+            .find(|&id| self.prepare_runtime_filters(id, now))
     }
 
-    fn prepare_runtime_filters(&mut self, id: usize) {
-        let Some(registry) = &mut self.runtime_filters else {
-            return;
-        };
+    fn prepare_runtime_filters(&mut self, id: usize, now: tokio::time::Instant) -> bool {
+        let registry = self.runtime_filters.as_mut().unwrap();
         let plan = self.stages[&id].plan_arc();
-        match registry.prepare(id, plan.clone(), &self.stages) {
-            Ok(prepared) if !Arc::ptr_eq(&prepared, &plan) => {
+        match registry.prepare(id, plan.clone(), &self.stages, now) {
+            Ok(None) => return false,
+            Ok(Some(prepared)) if !Arc::ptr_eq(&prepared, &plan) => {
                 let ExecutionStage::Running(stage) = self.stages.get_mut(&id).unwrap()
                 else {
                     unreachable!()
                 };
                 stage.replace_plan(prepared);
             }
-            Ok(_) => {}
+            Ok(Some(_)) => {}
             Err(error) => {
                 log::warn!(
                     "Runtime filter unavailable for stage {id}; bypassing: {error}"
                 );
+                registry.mark_prepared(id);
             }
         }
+        true
     }
 
     fn get_running_stage_id(&mut self, black_list: &[usize]) -> Option<usize> {
         if let Some(id) = self.find_running_stage_id(black_list) {
-            self.prepare_runtime_filters(id);
             Some(id)
         } else if self.revive() {
             self.get_running_stage_id(black_list)
@@ -1355,6 +1362,13 @@ impl ExecutionGraph for AdaptiveExecutionGraph {
             .collect::<Vec<RunningTaskInfo>>()
     }
 
+    fn take_runtime_filter_deadlines(&mut self) -> Vec<tokio::time::Instant> {
+        self.runtime_filters
+            .as_mut()
+            .map(|registry| registry.take_deadlines())
+            .unwrap_or_default()
+    }
+
     /// Total number of tasks in this plan that are ready for scheduling
     fn available_tasks(&self) -> usize {
         self.stages
@@ -1669,9 +1683,6 @@ impl ExecutionGraph for AdaptiveExecutionGraph {
         let session_id = self.session_id.clone();
 
         let ready_id = self.find_running_stage_id(&[]);
-        if let Some(id) = ready_id {
-            self.prepare_runtime_filters(id);
-        }
         let mut next_task = ready_id.and_then(|id| self.stages.get_mut(&id).map(|stage| (id, stage))).map(|(stage_id, stage)| {
             if let ExecutionStage::Running(stage) = stage {
                 use ballista_core::serde::scheduler::TaskKey;
