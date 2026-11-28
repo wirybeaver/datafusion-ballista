@@ -710,7 +710,12 @@ impl AdaptiveExecutionGraph {
             return;
         };
         let plan = self.stages[&id].plan_arc();
-        match registry.prepare(id, plan.clone(), &self.stages) {
+        match registry.prepare(
+            id,
+            plan.clone(),
+            &self.stages,
+            self.session_config.options(),
+        ) {
             Ok(prepared) if !Arc::ptr_eq(&prepared, &plan) => {
                 let ExecutionStage::Running(stage) = self.stages.get_mut(&id).unwrap()
                 else {

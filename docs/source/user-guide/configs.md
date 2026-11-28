@@ -179,6 +179,7 @@ Broadcast joins (such as TPC-H Q19) and partitioned fallback joins can use
 filters from a completed build. Each successful build task retains about 8–9 KB
 per filter in scheduler `TaskInfo` for the life of the job.
 Filters do not cross LIMIT or aggregates. `EXPLAIN ANALYZE` shows `rows_pruned`.
+Complete MinMax bounds can also prune eligible Parquet row groups.
 
 ## Shuffle Settings
 

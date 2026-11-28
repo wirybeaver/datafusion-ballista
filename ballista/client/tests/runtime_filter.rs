@@ -115,6 +115,63 @@ async fn distributed_runtime_filter_matches_unfiltered_joins() {
         }),
         "runtime filter must actually prune rows: {plan}"
     );
+    // Use disjoint Parquet row groups to observe read-time min/max pruning,
+    // independently of the post-scan row-filter metrics above.
+    let parquet_dir = dir.path().join("parquet_probe");
+    let local =
+        SessionContext::new_with_config(SessionConfig::new().with_target_partitions(1));
+    let mut writer_options = datafusion::common::config::TableParquetOptions::default();
+    writer_options.global.max_row_group_size = 25;
+    std::fs::create_dir(&parquet_dir).unwrap();
+    // Two files preserve parallel probe input and the existing broadcast
+    // dependency. Each file contains two disjoint row groups.
+    for (part, lower) in [0, 50].into_iter().enumerate() {
+        local
+            .read_csv(
+                dir.path().join("probe").to_str().unwrap(),
+                CsvReadOptions::new().schema(&schema),
+            )
+            .await
+            .unwrap()
+            .filter(col("k").between(lit(lower), lit(lower + 49)))
+            .unwrap()
+            .sort(vec![col("k").sort(true, false)])
+            .unwrap()
+            .write_parquet(
+                parquet_dir
+                    .join(format!("part-{part}.parquet"))
+                    .to_str()
+                    .unwrap(),
+                datafusion::dataframe::DataFrameWriteOptions::new()
+                    .with_single_file_output(true),
+                Some(writer_options.clone()),
+            )
+            .await
+            .unwrap();
+    }
+    ctx.register_parquet(
+        "parquet_probe",
+        parquet_dir.to_str().unwrap(),
+        ParquetReadOptions::default(),
+    )
+    .await
+    .unwrap();
+    let parquet_query = queries[0].replace("JOIN probe", "JOIN parquet_probe");
+    let filtered = run(&ctx, &parquet_query).await;
+    let plan = run(&ctx, &format!("EXPLAIN ANALYZE {parquet_query}")).await;
+    assert!(
+        plan.contains("pruning_predicate="),
+        "expected Parquet pruning predicate: {plan}"
+    );
+    assert!(plan.split("row_groups_pruned_statistics=").skip(1).any(|suffix| {
+        let mut parts = suffix.split_whitespace();
+        let total = parts.next().and_then(|value| value.parse::<usize>().ok());
+        let matched = parts.nth(2).and_then(|value| value.parse::<usize>().ok());
+        matches!((total, matched), (Some(total), Some(matched)) if total > matched)
+    }), "runtime MinMax must skip Parquet row groups: {plan}");
+    run(&ctx, "SET ballista.planner.runtime_filter.enabled = false").await;
+    assert_eq!(filtered, run(&ctx, &parquet_query).await);
+    run(&ctx, "SET ballista.planner.runtime_filter.enabled = true").await;
     // Independently runnable partitioned stages must preserve results even
     // when the producer has not reported before the probe is dispatched.
     for setting in [
