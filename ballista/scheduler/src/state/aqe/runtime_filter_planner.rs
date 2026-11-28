@@ -24,9 +24,10 @@ use super::execution_plan::{
 };
 use super::optimizer_rule::SelectJoinRule;
 use ballista_core::execution_plans::runtime_filter::supports_key;
-use ballista_core::execution_plans::{RuntimeFilterApplyExec, RuntimeFilterBuildExec};
-use datafusion::common::tree_node::{Transformed, TreeNode, TreeNodeRecursion};
+use ballista_core::execution_plans::{RuntimeFilterBuildExec, ShuffleReaderExec};
+use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
 use datafusion::common::{JoinType, Result, internal_err};
+use datafusion::datasource::physical_plan::{FileScanConfig, ParquetSource};
 use datafusion::datasource::source::DataSourceExec;
 use datafusion::physical_expr::{PhysicalExpr, expressions::Column};
 use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
@@ -42,6 +43,15 @@ use std::sync::Arc;
 struct Filter {
     id: u64,
     key: Arc<dyn PhysicalExpr>,
+}
+
+/// A scan occurrence in an executable stage. Counting occurrences keeps the
+/// two sides of a self-join distinct even if they share the same scan Arc.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct ProbeBinding {
+    pub scan_index: usize,
+    pub filter_id: u64,
+    pub column: usize,
 }
 
 #[derive(Clone, Default)]
@@ -201,59 +211,7 @@ impl RuntimeFilterPlanner {
             );
         };
         self.planned.insert(stage);
-        let mut input = boundary.children()[0]
-            .clone()
-            .transform_down(|node| {
-                // A resolved exchange is a reader, not part of this executable stage.
-                if node.is::<ExchangeExec>() {
-                    return Ok(Transformed::new(node, false, TreeNodeRecursion::Jump));
-                }
-                let Some(join) = node.downcast_ref::<HashJoinExec>() else {
-                    return Ok(Transformed::no(node));
-                };
-                if !supported_join(*join.join_type(), join.null_aware) {
-                    return Ok(Transformed::no(node));
-                }
-                let Some((left_key, right_key)) = join.on().first() else {
-                    return Ok(Transformed::no(node));
-                };
-                let Some(exchange) = join.left().downcast_ref::<ExchangeExec>() else {
-                    return Ok(Transformed::no(node));
-                };
-                let Some(column) = left_key.downcast_ref::<Column>() else {
-                    return Ok(Transformed::no(node));
-                };
-                let Some(producer) = exchange.stage_id() else {
-                    return Ok(Transformed::no(node));
-                };
-                let Some(filter) = self.builds.get(&(producer, column.index())) else {
-                    return Ok(Transformed::no(node));
-                };
-                let Some(probe) = push_apply(
-                    join.right().clone(),
-                    filter.id,
-                    right_key.clone(),
-                    false,
-                )?
-                else {
-                    return Ok(Transformed::no(node));
-                };
-                let left = join.left().clone();
-                Ok(Transformed::yes(replace_children_if_necessary(
-                    node,
-                    vec![left, probe],
-                )?))
-            })?
-            .data;
-        if let Some(probes) = self.probes.get(&stage) {
-            for filter in probes {
-                if let Some(probe) =
-                    push_apply(input.clone(), filter.id, filter.key.clone(), true)?
-                {
-                    input = probe;
-                }
-            }
-        }
+        let mut input = boundary.children()[0].clone();
         for (_, filter) in self.builds.range((stage, 0)..=(stage, usize::MAX)) {
             input = Arc::new(RuntimeFilterBuildExec::new(
                 input,
@@ -262,6 +220,60 @@ impl RuntimeFilterPlanner {
             ));
         }
         replace_children_if_necessary(boundary, vec![input])
+    }
+
+    pub fn probe_bindings(
+        &self,
+        stage: usize,
+        writer: &dyn ExecutionPlan,
+    ) -> Vec<ProbeBinding> {
+        let input = writer.children()[0];
+        let mut bindings = vec![];
+        for filter in self.probes.get(&stage).into_iter().flatten() {
+            if let Some(column) = probe_column(input.as_ref(), filter.key.as_ref(), true)
+            {
+                bindings.push(ProbeBinding {
+                    scan_index: 0,
+                    filter_id: filter.id,
+                    column,
+                });
+            }
+        }
+        let mut next_scan = 0;
+        self.collect_join_probes(input.as_ref(), &mut next_scan, &mut bindings);
+        bindings
+    }
+
+    fn collect_join_probes(
+        &self,
+        node: &dyn ExecutionPlan,
+        next_scan: &mut usize,
+        bindings: &mut Vec<ProbeBinding>,
+    ) {
+        if node.is::<DataSourceExec>() {
+            *next_scan += 1;
+            return;
+        }
+        if let Some(join) = node.downcast_ref::<HashJoinExec>()
+            && supported_join(*join.join_type(), join.null_aware)
+            && let Some(reader) = join.left().downcast_ref::<ShuffleReaderExec>()
+            && let Some((left, right)) = join.on().first()
+            && let Some(build_key) = left.downcast_ref::<Column>()
+            && let Some(filter) = self.builds.get(&(reader.stage_id, build_key.index()))
+            && let Some(column) =
+                probe_column(join.right().as_ref(), right.as_ref(), false)
+        {
+            // The build reader is a leaf and the eligible probe is unary.
+            // Its scan is therefore the next scan visited in this stage.
+            bindings.push(ProbeBinding {
+                scan_index: *next_scan,
+                filter_id: filter.id,
+                column,
+            });
+        }
+        for child in node.children() {
+            self.collect_join_probes(child.as_ref(), next_scan, bindings);
+        }
     }
 }
 
@@ -282,8 +294,17 @@ fn probe_column(
 ) -> Option<usize> {
     let mut column = key.downcast_ref::<Column>()?.index();
     loop {
-        if plan.is::<DataSourceExec>() {
-            return useful.then_some(column);
+        if let Some(scan) = plan.downcast_ref::<DataSourceExec>() {
+            // An ordinary filter can already be inside the Parquet reader.
+            let filtered_parquet = scan
+                .data_source()
+                .downcast_ref::<FileScanConfig>()
+                .is_some_and(|files| {
+                    files.limit.is_none()
+                        && files.file_source.downcast_ref::<ParquetSource>().is_some()
+                        && files.file_source.filter().is_some()
+                });
+            return (useful || filtered_parquet).then_some(column);
         }
         // LIMIT may be fused into a filter or coalesce. Never change which
         // rows it selects by inserting a runtime filter below it.
@@ -300,6 +321,8 @@ fn probe_column(
             column = filter.projection().as_ref().map_or(column, |p| p[column]);
             useful = true;
             plan = filter.input().as_ref();
+        } else if let Some(build) = plan.downcast_ref::<RuntimeFilterBuildExec>() {
+            plan = build.children()[0].as_ref();
         } else if let Some(repartition) = plan.downcast_ref::<RepartitionExec>() {
             plan = repartition.input().as_ref();
         } else {
@@ -309,42 +332,16 @@ fn probe_column(
     }
 }
 
-fn push_apply(
-    plan: Arc<dyn ExecutionPlan>,
-    id: u64,
-    key: Arc<dyn PhysicalExpr>,
-    useful: bool,
-) -> Result<Option<Arc<dyn ExecutionPlan>>> {
-    let Some(column) = probe_column(plan.as_ref(), key.as_ref(), useful) else {
-        return Ok(None);
-    };
-    // probe_column established a single scan below a unary pipeline.
-    plan.transform_up(|node| {
-        if !node.is::<DataSourceExec>() {
-            return Ok(Transformed::no(node));
-        }
-        let key = Arc::new(Column::new(node.schema().field(column).name(), column));
-        Ok(Transformed::yes(Arc::new(RuntimeFilterApplyExec::try_new(
-            node, id, key, None,
-        )?)))
-    })
-    .map(|plan| Some(plan.data))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ballista_core::execution_plans::runtime_filter::collect_reports;
-    use ballista_core::serde::protobuf::RuntimeFilterPayload;
     use datafusion::arrow::array::{ArrayRef, Int64Array, RecordBatch};
-    use datafusion::arrow::compute::concat_batches;
     use datafusion::arrow::datatypes::{DataType, Field, Schema};
     use datafusion::common::NullEquality;
     use datafusion::datasource::memory::MemorySourceConfig;
     use datafusion::physical_expr::expressions::{col, lit};
     use datafusion::physical_plan::filter::FilterExecBuilder;
-    use datafusion::physical_plan::{collect, displayable, joins::PartitionMode};
-    use datafusion::prelude::SessionContext;
+    use datafusion::physical_plan::{displayable, joins::PartitionMode};
 
     fn source(values: impl IntoIterator<Item = i64>) -> Arc<dyn ExecutionPlan> {
         let schema = Arc::new(Schema::new(vec![Field::new("k", DataType::Int64, false)]));
@@ -354,34 +351,6 @@ mod tests {
         )
         .unwrap();
         MemorySourceConfig::try_new_exec(&[vec![batch]], schema, None).unwrap()
-    }
-
-    async fn report(values: impl IntoIterator<Item = i64>) -> RuntimeFilterPayload {
-        let build: Arc<dyn ExecutionPlan> = Arc::new(RuntimeFilterBuildExec::new(
-            source(values),
-            0,
-            Arc::new(Column::new("k", 0)),
-        ));
-        collect(build.clone(), SessionContext::new().task_ctx())
-            .await
-            .unwrap();
-        collect_reports(&build).unwrap().pop().unwrap()
-    }
-
-    fn bind(
-        plan: Arc<dyn ExecutionPlan>,
-        payload: &RuntimeFilterPayload,
-    ) -> Arc<dyn ExecutionPlan> {
-        plan.transform_up(|node| {
-            let Some(apply) = node.downcast_ref::<RuntimeFilterApplyExec>() else {
-                return Ok(Transformed::no(node));
-            };
-            Ok(Transformed::yes(Arc::new(
-                apply.with_payload(payload.clone())?,
-            )))
-        })
-        .unwrap()
-        .data
     }
 
     #[test]
@@ -416,8 +385,8 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn runtime_filter_maps_keys_through_scan_projections() {
+    #[test]
+    fn runtime_filter_maps_keys_through_scan_projections() {
         let batch = RecordBatch::try_from_iter([
             (
                 "value",
@@ -448,29 +417,12 @@ mod tests {
             )
             .unwrap(),
         );
-        let plan = push_apply(probe, 0, Arc::new(Column::new("join_key", 1)), false)
-            .unwrap()
-            .unwrap();
-        let plan = bind(plan, &report(0..2).await);
-        let schema = plan.schema();
-        let batches = collect(plan, SessionContext::new().task_ctx())
-            .await
-            .unwrap();
-        let batch = concat_batches(&schema, &batches).unwrap();
-        assert_eq!(
-            batch
-                .column(0)
-                .as_any()
-                .downcast_ref::<Int64Array>()
-                .unwrap()
-                .values(),
-            &[10, 20]
-        );
+        let key = Column::new("join_key", 1);
+        assert_eq!(probe_column(probe.as_ref(), &key, false), Some(1));
     }
 
-    #[tokio::test]
-    async fn runtime_filter_preserves_limits_fused_into_unary_operators() {
-        let payload = report([2]).await;
+    #[test]
+    fn runtime_filter_preserves_limits_fused_into_unary_operators() {
         let key: Arc<dyn PhysicalExpr> = Arc::new(Column::new("k", 0));
         let probes: [Arc<dyn ExecutionPlan>; 2] = [
             Arc::new(
@@ -484,27 +436,7 @@ mod tests {
         for probe in probes {
             // The limited input is [0, 1]. Filtering before its limit would
             // instead retain key 2 and incorrectly add a row to the join.
-            let probe = push_apply(probe.clone(), 0, key.clone(), true)
-                .unwrap()
-                .unwrap_or(probe);
-            let join = Arc::new(
-                HashJoinExec::try_new(
-                    source([2]),
-                    bind(probe, &payload),
-                    vec![(key.clone(), key.clone())],
-                    None,
-                    &JoinType::Inner,
-                    None,
-                    PartitionMode::CollectLeft,
-                    NullEquality::NullEqualsNothing,
-                    false,
-                )
-                .unwrap(),
-            );
-            let rows = collect(join, SessionContext::new().task_ctx())
-                .await
-                .unwrap();
-            assert_eq!(rows.iter().map(RecordBatch::num_rows).sum::<usize>(), 0);
+            assert!(probe_column(probe.as_ref(), key.as_ref(), true).is_none());
         }
     }
 }

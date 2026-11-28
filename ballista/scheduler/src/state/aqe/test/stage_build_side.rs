@@ -221,13 +221,22 @@ async fn runtime_filter_applies_after_staged_build_broadcasts() {
         .unwrap();
     let stages = planner.actionable_stages().unwrap().0.unwrap();
     assert_eq!(stages.len(), 1);
+    let writer = &stages[0].plan;
+    let bindings = planner.probe_bindings(writer.stage_id(), writer.as_ref());
+    assert_eq!(
+        bindings,
+        [super::super::runtime_filter_planner::ProbeBinding {
+            scan_index: 0,
+            filter_id: 0,
+            column: 0
+        }]
+    );
     assert_plan!(stages[0].plan.as_ref(), @ "
     ShuffleWriterExec: partitioning: UnknownPartitioning(4)
       HashJoinExec: mode=CollectLeft, join_type=Inner, on=[(id@0, id@0)], projection=[id@1]
         ShuffleReaderExec: upstream_stage: 0, broadcast: true, upstream_partition_count: 4
         FilterExec: val@1 > 0, projection=[id@0]
-          RuntimeFilterApplyExec: id=0, key=id@0, ready=false
-            DataSourceExec: partitions=4, partition_sizes=[1, 1, 1, 1]
+          DataSourceExec: partitions=4, partition_sizes=[1, 1, 1, 1]
     ");
 }
 
@@ -240,10 +249,19 @@ async fn runtime_filter_reuses_completed_build_for_partitioned_fallback() {
         .unwrap();
     let stages = planner.actionable_stages().unwrap().0.unwrap();
     assert_eq!(stages.len(), 1);
+    let writer = &stages[0].plan;
+    let bindings = planner.probe_bindings(writer.stage_id(), writer.as_ref());
+    assert_eq!(
+        bindings,
+        [super::super::runtime_filter_planner::ProbeBinding {
+            scan_index: 0,
+            filter_id: 0,
+            column: 0
+        }]
+    );
     assert_plan!(stages[0].plan.as_ref(), @ "
     SortShuffleWriterExec: partitioning=Hash([id@0], 4)
       FilterExec: val@1 > 0, projection=[id@0]
-        RuntimeFilterApplyExec: id=0, key=id@0, ready=false
-          DataSourceExec: partitions=4, partition_sizes=[1, 1, 1, 1]
+        DataSourceExec: partitions=4, partition_sizes=[1, 1, 1, 1]
     ");
 }

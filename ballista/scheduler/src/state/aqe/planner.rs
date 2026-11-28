@@ -126,6 +126,17 @@ impl Debug for AdaptivePlanner {
 }
 
 impl AdaptivePlanner {
+    pub(super) fn probe_bindings(
+        &self,
+        stage: usize,
+        writer: &dyn ExecutionPlan,
+    ) -> Vec<super::runtime_filter_planner::ProbeBinding> {
+        self.runtime_filters
+            .as_ref()
+            .map(|planner| planner.probe_bindings(stage, writer))
+            .unwrap_or_default()
+    }
+
     /// Creates a new `AdaptivePlanner` with the specified physical optimizer rules.
     ///
     /// # Arguments:

@@ -21,19 +21,19 @@
 //! Missing/partial reports are never interpreted as empty filters. The scheduler
 //! unions all successful producer tasks before specializing a probe stage.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, btree_map::Entry};
 use std::fmt::{self, Formatter};
 use std::sync::Arc;
 
-use datafusion::arrow::array::{ArrayRef, BooleanArray};
+use datafusion::arrow::array::{ArrayRef, BooleanArray, RecordBatch};
 use datafusion::arrow::compute::filter_record_batch;
-use datafusion::arrow::datatypes::DataType;
+use datafusion::arrow::datatypes::{DataType, Schema};
 use datafusion::common::hash_utils::{RandomState, with_hashes};
 use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
 use datafusion::common::{Result, ScalarValue, Statistics, internal_err};
 use datafusion::execution::TaskContext;
 use datafusion::functions_aggregate::min_max::{MaxAccumulator, MinAccumulator};
-use datafusion::logical_expr::Accumulator;
+use datafusion::logical_expr::{Accumulator, ColumnarValue};
 use datafusion::physical_expr::PhysicalExpr;
 use datafusion::physical_plan::execution_plan::CardinalityEffect;
 use datafusion::physical_plan::metrics::{
@@ -83,13 +83,14 @@ pub fn supports_key(data_type: &DataType) -> bool {
     )
 }
 
-/// A Bloom filter with a bounded IN hash set and optional range summary.
+/// A Bloom filter with bounded IN hashes, optional exact keys, and range bounds.
 /// Hash collisions retain extra candidates; the join verifies actual equality.
 #[derive(Clone, Debug)]
 pub struct RuntimeFilter {
     bloom: Vec<u8>,
     has_null: bool,
     in_hashes: Option<BTreeSet<u64>>,
+    in_values: Option<BTreeMap<u64, ScalarValue>>,
     bounds: Option<(ScalarValue, ScalarValue)>,
     bounds_disabled: bool,
 }
@@ -100,6 +101,7 @@ impl Default for RuntimeFilter {
             bloom: vec![0; BLOOM_BYTES],
             has_null: false,
             in_hashes: Some(BTreeSet::new()),
+            in_values: Some(BTreeMap::new()),
             bounds: None,
             bounds_disabled: false,
         }
@@ -110,6 +112,21 @@ fn bloom_bits(hash: u64) -> impl Iterator<Item = usize> {
     let step = hash.rotate_left(31) | 1;
     (0..4u64).map(move |i| {
         hash.wrapping_add(i.wrapping_mul(step)) as usize % (BLOOM_BYTES * 8)
+    })
+}
+
+fn bloom_contains(bloom: &[u8], hash: u64) -> bool {
+    bloom_bits(hash).all(|bit| bloom[bit / 8] & (1 << (bit % 8)) != 0)
+}
+
+fn probe_mask(
+    keys: &ArrayRef,
+    contains: impl Fn(u64, bool) -> bool,
+) -> Result<BooleanArray> {
+    with_hashes([keys], &HASH_STATE, |hashes| {
+        Ok(BooleanArray::from_iter(hashes.iter().enumerate().map(
+            |(row, &hash)| Some(contains(hash, keys.is_null(row))),
+        )))
     })
 }
 
@@ -148,6 +165,29 @@ impl RuntimeFilter {
                         values.insert(hash);
                         if values.len() > MAX_VALUES {
                             self.in_hashes = None;
+                        }
+                    }
+                    if let Some(values) = &mut self.in_values {
+                        let retain = self.in_hashes.is_some()
+                            && match values.entry(hash) {
+                                // A collision still permits hash filtering, but
+                                // this hash cannot stand for a single exact key.
+                                Entry::Occupied(entry) => {
+                                    entry.get().eq_array(keys, row)?
+                                }
+                                Entry::Vacant(entry) => {
+                                    let value =
+                                        ScalarValue::try_from_array(keys.as_ref(), row)?;
+                                    if value.size() <= MAX_BOUND_BYTES {
+                                        entry.insert(value);
+                                        true
+                                    } else {
+                                        false
+                                    }
+                                }
+                            };
+                        if !retain {
+                            self.in_values = None;
                         }
                     }
                 }
@@ -193,7 +233,7 @@ impl RuntimeFilter {
         if let Some(values) = &self.in_hashes {
             return values.contains(&hash);
         }
-        bloom_bits(hash).all(|bit| self.bloom[bit / 8] & (1 << (bit % 8)) != 0)
+        bloom_contains(&self.bloom, hash)
     }
 
     /// Union another complete producer summary into this filter.
@@ -210,6 +250,22 @@ impl RuntimeFilter {
                 }
             }
             _ => self.in_hashes = None,
+        }
+        let exact = self.in_hashes.is_some()
+            && match (&mut self.in_values, &other.in_values) {
+                (Some(values), Some(more)) => {
+                    more.iter().all(|(&hash, value)| match values.entry(hash) {
+                        Entry::Occupied(entry) => entry.get() == value,
+                        Entry::Vacant(entry) => {
+                            entry.insert(value.clone());
+                            true
+                        }
+                    })
+                }
+                _ => false,
+            };
+        if !exact {
+            self.in_values = None;
         }
         self.bounds_disabled |= other.bounds_disabled;
         if self.bounds_disabled {
@@ -232,6 +288,12 @@ impl RuntimeFilter {
                 .iter()
                 .flat_map(|hashes| hashes.iter().copied())
                 .collect(),
+            in_values: self
+                .in_values
+                .iter()
+                .flat_map(BTreeMap::values)
+                .map(|value| Ok(value.try_into()?))
+                .collect::<Result<_>>()?,
             min: self
                 .bounds
                 .as_ref()
@@ -261,6 +323,18 @@ impl RuntimeFilter {
             in_hashes: payload
                 .has_in_set
                 .then(|| payload.in_hashes.iter().copied().collect()),
+            in_values: (payload.has_in_set
+                && payload.in_hashes.len() == payload.in_values.len())
+            .then(|| {
+                payload
+                    .in_hashes
+                    .iter()
+                    .copied()
+                    .zip(&payload.in_values)
+                    .map(|(hash, value)| Ok((hash, value.try_into()?)))
+                    .collect::<Result<_>>()
+            })
+            .transpose()?,
             // Empty/all-NULL producers are the identity for range union. A
             // nonempty Bloom without bounds means a large bound was omitted.
             bounds_disabled: bounds.is_none()
@@ -517,11 +591,7 @@ impl ExecutionPlan for RuntimeFilterApplyExec {
         let stream = input.map(move |batch| {
             let batch = batch?;
             let keys = key.evaluate(&batch)?.into_array(batch.num_rows())?;
-            let keep = with_hashes([&keys], &HASH_STATE, |hashes| {
-                Ok(BooleanArray::from_iter(hashes.iter().enumerate().map(
-                    |(row, &hash)| Some(filter.contains(hash, keys.is_null(row))),
-                )))
-            })?;
+            let keep = probe_mask(&keys, |hash, is_null| filter.contains(hash, is_null))?;
             let filtered = filter_record_batch(&batch, &keep)?;
             pruned.add(batch.num_rows() - filtered.num_rows());
             Ok(filtered)
@@ -530,6 +600,115 @@ impl ExecutionPlan for RuntimeFilterApplyExec {
             self.schema(),
             stream,
         )))
+    }
+}
+
+/// A complete distributed Bloom predicate for evaluating decoded scan rows.
+#[derive(Eq)]
+pub struct RuntimeFilterBloomExpr {
+    key: Arc<dyn PhysicalExpr>,
+    filter_id: u64,
+    bloom: Arc<[u8]>,
+    has_null: bool,
+}
+
+impl RuntimeFilterBloomExpr {
+    /// Construct a probe predicate from a complete Bloom summary.
+    pub fn try_new(
+        key: Arc<dyn PhysicalExpr>,
+        payload: RuntimeFilterPayload,
+    ) -> Result<Self> {
+        if payload.version != VERSION || payload.bloom.len() != BLOOM_BYTES {
+            return internal_err!("Invalid runtime Bloom predicate payload");
+        }
+        Ok(Self {
+            key,
+            filter_id: payload.filter_id,
+            bloom: payload.bloom.into(),
+            has_null: payload.has_null,
+        })
+    }
+
+    pub(crate) fn payload(&self) -> RuntimeFilterPayload {
+        RuntimeFilterPayload {
+            filter_id: self.filter_id,
+            version: VERSION,
+            bloom: self.bloom.to_vec(),
+            has_null: self.has_null,
+            ..Default::default()
+        }
+    }
+}
+
+impl std::hash::Hash for RuntimeFilterBloomExpr {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        // The job assigns a unique id to each filter. Avoid hashing its bitset
+        // each time the optimizer looks up the expression.
+        self.filter_id.hash(state);
+        self.key.hash(state);
+    }
+}
+
+impl PartialEq for RuntimeFilterBloomExpr {
+    fn eq(&self, other: &Self) -> bool {
+        self.key.eq(&other.key)
+            && self.filter_id == other.filter_id
+            && self.bloom == other.bloom
+            && self.has_null == other.has_null
+    }
+}
+
+impl fmt::Display for RuntimeFilterBloomExpr {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        write!(f, "runtime_bloom({}, {})", self.filter_id, self.key)
+    }
+}
+
+impl fmt::Debug for RuntimeFilterBloomExpr {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(self, f)
+    }
+}
+
+impl PhysicalExpr for RuntimeFilterBloomExpr {
+    fn fmt_sql(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(self, f)
+    }
+
+    fn data_type(&self, _: &Schema) -> Result<DataType> {
+        Ok(DataType::Boolean)
+    }
+
+    fn nullable(&self, _: &Schema) -> Result<bool> {
+        Ok(false)
+    }
+
+    fn evaluate(&self, batch: &RecordBatch) -> Result<ColumnarValue> {
+        let keys = self.key.evaluate(batch)?.into_array(batch.num_rows())?;
+        let keep = probe_mask(&keys, |hash, is_null| {
+            if is_null {
+                self.has_null
+            } else {
+                bloom_contains(&self.bloom, hash)
+            }
+        })?;
+        Ok(ColumnarValue::Array(Arc::new(keep)))
+    }
+
+    fn children(&self) -> Vec<&Arc<dyn PhysicalExpr>> {
+        vec![&self.key]
+    }
+
+    fn with_new_children(
+        self: Arc<Self>,
+        mut children: Vec<Arc<dyn PhysicalExpr>>,
+    ) -> Result<Arc<dyn PhysicalExpr>> {
+        Ok(Arc::new(Self {
+            key: children.remove(0),
+            filter_id: self.filter_id,
+            bloom: self.bloom.clone(),
+            has_null: self.has_null,
+        }))
     }
 }
 
@@ -704,6 +883,72 @@ mod tests {
             Ok(())
         })
         .unwrap();
+    }
+
+    #[test]
+    fn runtime_filter_bloom_survives_parquet_predicate_serde() {
+        use datafusion::datasource::listing::PartitionedFile;
+        use datafusion::datasource::physical_plan::{
+            FileScanConfig, FileScanConfigBuilder, ParquetSource,
+        };
+        use datafusion::datasource::source::DataSourceExec;
+        use datafusion::execution::object_store::ObjectStoreUrl;
+        use datafusion_proto::physical_plan::AsExecutionPlan;
+        use datafusion_proto::protobuf::PhysicalPlanNode;
+
+        let mut filter = RuntimeFilter::default();
+        let build: ArrayRef = Arc::new(Int64Array::from_iter(
+            (0..=MAX_VALUES as i64).map(Some).chain([None]),
+        ));
+        filter.update(&build).unwrap();
+        let key = Arc::new(Column::new("key", 0));
+        let predicate = Arc::new(
+            RuntimeFilterBloomExpr::try_new(key, filter.to_proto(3).unwrap()).unwrap(),
+        );
+        let schema =
+            Arc::new(Schema::new(vec![Field::new("key", DataType::Int64, true)]));
+        let source = ParquetSource::new(schema.clone())
+            .with_predicate(predicate)
+            .with_pushdown_filters(true);
+        let conf = FileScanConfigBuilder::new(
+            ObjectStoreUrl::local_filesystem(),
+            Arc::new(source),
+        )
+        .with_file(PartitionedFile::new("probe.parquet", 1))
+        .build();
+        let scan = DataSourceExec::from_data_source(conf);
+        let codec = BallistaPhysicalExtensionCodec::default();
+        let proto = PhysicalPlanNode::try_from_physical_plan(scan, &codec).unwrap();
+        let ctx = SessionContext::new().task_ctx();
+        let scan = PhysicalPlanNode::decode(proto.encode_to_vec().as_slice())
+            .unwrap()
+            .try_into_physical_plan(&ctx, &codec)
+            .unwrap();
+        let conf = scan
+            .downcast_ref::<DataSourceExec>()
+            .unwrap()
+            .data_source()
+            .downcast_ref::<FileScanConfig>()
+            .unwrap();
+        let predicate = conf.file_source.filter().unwrap();
+        let keys: ArrayRef = Arc::new(Int64Array::from_iter(
+            [Some(0), None]
+                .into_iter()
+                .chain((10_000..10_100).map(Some)),
+        ));
+        let batch = RecordBatch::try_new(schema, vec![keys.clone()]).unwrap();
+        let result = predicate
+            .evaluate(&batch)
+            .unwrap()
+            .into_array(batch.num_rows())
+            .unwrap();
+        let expected =
+            probe_mask(&keys, |hash, is_null| filter.contains(hash, is_null)).unwrap();
+        assert!(expected.value(0) && expected.value(1) && expected.has_false());
+        assert_eq!(
+            result.as_any().downcast_ref::<BooleanArray>().unwrap(),
+            &expected
+        );
     }
 
     #[test]

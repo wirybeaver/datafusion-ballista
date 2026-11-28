@@ -285,7 +285,11 @@ impl AdaptiveExecutionGraph {
             .map(|_| {
                 let mut registry = runtime_filter::RuntimeFilterRegistry::default();
                 for (&id, stage) in &stages {
-                    registry.register(id, stage.plan());
+                    registry.register(
+                        id,
+                        stage.plan(),
+                        planner.probe_bindings(id, stage.plan()),
+                    );
                 }
                 registry
             });
@@ -622,7 +626,11 @@ impl AdaptiveExecutionGraph {
                             stage,
                         )?;
                         if let Some(registry) = &mut self.runtime_filters {
-                            registry.register(stage_id, stage.plan());
+                            registry.register(
+                                stage_id,
+                                stage.plan(),
+                                self.planner.probe_bindings(stage_id, stage.plan()),
+                            );
                         }
                         self.stages.insert(stage_id, stage);
                     }
@@ -710,7 +718,7 @@ impl AdaptiveExecutionGraph {
             return;
         };
         let plan = self.stages[&id].plan_arc();
-        match registry.prepare(id, plan.clone(), &self.stages) {
+        match registry.prepare(id, plan.clone(), &self.stages, &self.session_config) {
             Ok(prepared) if !Arc::ptr_eq(&prepared, &plan) => {
                 let ExecutionStage::Running(stage) = self.stages.get_mut(&id).unwrap()
                 else {
