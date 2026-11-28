@@ -125,6 +125,9 @@ pub struct RuntimeFilterPayload {
     pub min: ::core::option::Option<::datafusion_proto_common::ScalarValue>,
     #[prost(message, optional, tag = "8")]
     pub max: ::core::option::Option<::datafusion_proto_common::ScalarValue>,
+    /// Exact non-null keys in in_hashes order, when every hash has a bounded value.
+    #[prost(message, repeated, tag = "9")]
+    pub in_values: ::prost::alloc::vec::Vec<::datafusion_proto_common::ScalarValue>,
 }
 /// Root of a stage in a pipelined job. Instead of writing shuffle files, it
 /// routes its input into bounded in-memory queues that consumer tasks stream

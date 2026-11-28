@@ -90,6 +90,8 @@ message RuntimeFilterPayload {
   repeated fixed64 in_hashes = 6;
   datafusion_common.ScalarValue min = 7;
   datafusion_common.ScalarValue max = 8;
+  // Exact non-null keys in in_hashes order, when every hash has a bounded value.
+  repeated datafusion_common.ScalarValue in_values = 9;
 }
 
 // Root of a stage in a pipelined job. Instead of writing shuffle files, it

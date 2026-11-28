@@ -27,6 +27,9 @@ use datafusion::common::{DataFusionError, Result};
 use datafusion::execution::TaskContext;
 use datafusion::logical_expr::Extension;
 use datafusion::physical_expr::PhysicalExpr;
+use datafusion::physical_expr_common::physical_expr::{
+    proto_decode::PhysicalExprDecodeCtx, proto_encode::PhysicalExprEncodeCtx,
+};
 use datafusion::physical_plan::{ExecutionPlan, Partitioning};
 use datafusion_proto::logical_plan::file_formats::{
     ArrowLogicalExtensionCodec, AvroLogicalExtensionCodec, CsvLogicalExtensionCodec,
@@ -55,6 +58,7 @@ use std::marker::PhantomData;
 use std::sync::Arc;
 use std::{convert::TryInto, io::Cursor};
 
+use crate::execution_plans::runtime_filter::RuntimeFilterBloomExpr;
 use crate::execution_plans::sort_shuffle::{ShuffleRouting, SortShuffleConfig};
 use crate::execution_plans::{
     BufferExec, BufferMode, ChaosExec, CoalescePlan, FinalizedPartitionState, InputOrder,
@@ -617,6 +621,44 @@ fn scalar_to_proto(
 }
 
 impl PhysicalExtensionCodec for BallistaPhysicalExtensionCodec {
+    fn try_decode_expr(
+        &self,
+        buf: &[u8],
+        inputs: &[Arc<dyn PhysicalExpr>],
+        _ctx: &PhysicalExprDecodeCtx<'_>,
+    ) -> Result<Arc<dyn PhysicalExpr>> {
+        let [key] = inputs else {
+            return datafusion::common::internal_err!(
+                "Runtime Bloom predicate expects one key"
+            );
+        };
+        let payload = protobuf::RuntimeFilterPayload::decode(buf).map_err(|error| {
+            DataFusionError::Internal(format!(
+                "Could not decode runtime Bloom predicate: {error}"
+            ))
+        })?;
+        Ok(Arc::new(RuntimeFilterBloomExpr::try_new(
+            key.clone(),
+            payload,
+        )?))
+    }
+
+    fn try_encode_expr(
+        &self,
+        node: &Arc<dyn PhysicalExpr>,
+        buf: &mut Vec<u8>,
+        ctx: &PhysicalExprEncodeCtx<'_>,
+    ) -> Result<()> {
+        let Some(bloom) = node.downcast_ref::<RuntimeFilterBloomExpr>() else {
+            return self.default_codec.try_encode_expr(node, buf, ctx);
+        };
+        bloom.payload().encode(buf).map_err(|error| {
+            DataFusionError::Internal(format!(
+                "Could not encode runtime Bloom predicate: {error}"
+            ))
+        })
+    }
+
     fn try_decode(
         &self,
         buf: &[u8],
